@@ -1,0 +1,5 @@
+main()
+{}
+
+another_func()
+{}
