@@ -1,6 +1,6 @@
 main()
 {
-    level.myVar = "hello world";
+    /*level.myVar = "hello world";
     maps\mp\gametype\_callback::func();
     script::func();
     myref = script::func();
@@ -11,13 +11,26 @@ main()
     array[b[a]] = 1;
 
     ref = ::myfunc;
-    [[ref]]();
 
-    ref2 = ::another_func;
+    ref2 = test2::another_func;
+    self.some thread foreign::func();
+    level thread [[ref]]();
+    [[ref]]();
+    vec = (1, 2, array[1]);*/
+    func();
+    test2::another_func();
+    another_func();
+    folder\test3::func_in_test3();
 }
 
 func()
 {}
+
+another_func()
+{}
+
+//another_func()
+//{}
 
 /*
 command_register(permId, name, function, description, usage)

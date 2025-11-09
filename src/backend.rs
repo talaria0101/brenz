@@ -1,8 +1,9 @@
 //! Backend for our language server
 use tower_lsp::Client;
 use tower_lsp::lsp_types::*;
-use tree_sitter::{Parser, Tree};
+use tree_sitter::{Parser, Tree, Node};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use tokio::sync::Mutex;
 use std::fmt::Debug;
 
@@ -17,10 +18,12 @@ pub struct Backend {
     checker: Mutex<BracketChecker>,
     /// The Parser instance
     parser: Mutex<Parser>,
+    /// Your workspace/project folder
+    pub workspace_root: Mutex<Option<PathBuf>>,
     /// Stores parsed trees for each document
     pub trees: Mutex<HashMap<Url, Tree>>,
     /// Function Definitions
-    pub fn_defs: Mutex<HashMap<String, (Url, Range)>>,
+    pub fn_defs: Mutex<HashMap<Url, HashMap<String, Range>>>,
     /// For storing text content of scripts
     pub docs_content: Mutex<HashMap<Url, String>>,
 }
@@ -45,6 +48,7 @@ impl Backend {
             client,
             checker: Mutex::new(BracketChecker::new()),
             parser: Mutex::new(parser),
+            workspace_root: Mutex::new(None),
             trees: Mutex::new(HashMap::new()),
             fn_defs: Mutex::new(HashMap::new()),
             docs_content: Mutex::new(HashMap::new()),
@@ -101,11 +105,10 @@ impl Backend {
                     }
                 }
 
-                // Function Definitions
-                let fns = self.extract_fns(&tree, text, &uri);
-                self.fn_defs.lock().await.extend(fns);
+                self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
 
-                self.client.publish_diagnostics(uri, diagnostics, None).await;
+                let fns = self.extract_fns(&tree, text);
+                self.fn_defs.lock().await.insert(uri, fns);
             }
             None => {
                 let diagnostic = Diagnostic {
@@ -226,9 +229,9 @@ impl Backend {
     }
 
     /// Get function definitions from parsed trees
-    fn extract_fns(&self, tree: &Tree, source: &str, uri: &Url) -> HashMap<String, (Url, Range)>
+    fn extract_fns(&self, tree: &Tree, source: &str) -> HashMap<String, Range>
     {
-        let mut fns: HashMap<String, (Url, Range)> = HashMap::new();
+        let mut fns: HashMap<String, Range> = HashMap::new();
         let root = tree.root_node();
         let mut cursor = root.walk();
 
@@ -242,27 +245,74 @@ impl Backend {
                         end: self.byte_to_position(source, name_node.end_byte()),
                     };
 
-                    fns.insert(name.to_string(), (uri.clone(), range));
+                    fns.insert(name.to_string(), range);
                 }
             }
         }
         fns
     }
 
-    /// Helper to find identifier at position
-    pub fn find_identifier_at_pos(&self, tree: &Tree, source: &str, position: Position) -> Option<String>
+    /// Helper to find node at position
+    pub fn node_at_pos<'a>(&self, tree: &'a Tree, source: &str, position: Position) -> Option<Node<'a>>
     {
         let byte_offset = self.position_to_byte(source, position);
         let root = tree.root_node();
 
-        // Find the smallest node at this position
-        let node = root.descendant_for_byte_range(byte_offset, byte_offset)?;
-        if node.kind() == "identifier" {
-            let text = &source[node.start_byte()..node.end_byte()];
-            return Some(text.to_string());
-        }
+        /*match  {
+            Ok(n) => Some(n),
+            Err(e) => {
+                self.client.log_message(MessageType::LOG, format!("No node at {:?}", position));
+                None
+            }
+        }*/
 
+        root.descendant_for_byte_range(byte_offset, byte_offset)
+    }
+
+    pub fn find_parent_of_kind<'a>(&self, mut node: Node<'a>, kind: &str) -> Option<Node<'a>>
+    {
+        loop {
+            if node.kind() == kind {
+                return Some(node);
+            }
+            node = node.parent()?;
+        }
+    }
+
+    pub fn find_child_of_kind<'a>(&self, node: Node<'a>, kind: &str) -> Option<Node<'a>>
+    {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == kind {
+                return Some(child);
+            }
+        }
         None
+    }
+
+    /**
+     Returns
+     - `path` of the script (if exists)
+     - `name` of the script
+     - `function` called or referenced
+
+     of a `foreign_func_ref` or `foreign_call_expression` node
+    **/
+    pub fn process_foreign_fn(&self, node: Node, source: &str) -> Option<(Option<String>, String, String)>
+    {
+        let path = match node.child_by_field_name("path") {
+            Some(p) => {
+                Some(&source[p.start_byte()..p.end_byte()].to_string())
+            }
+            None => None,
+        };
+        let script_node = node.child_by_field_name("script")?;
+        let function_node = node.child_by_field_name("function")?;
+
+        let script_name = &source[script_node.start_byte()..script_node.end_byte()];
+        let function_name = &source[function_node.start_byte()..function_node.end_byte()];
+
+        Some((path.cloned(), script_name.to_string(), function_name.to_string()))
     }
 
     /// Some editors (including kate) might not show a red underline at EOL.
