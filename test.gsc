@@ -17,10 +17,10 @@ main()
     level thread [[ref]]();
     [[ref]]();
     vec = (1, 2, array[1]);*/
-    func();
-    test2::another_func();
+    self thread func();
+    level thread test2::another_func();
     another_func();
-    folder\test3::func_in_test3();
+    thread folder\test3::func_in_test3();
 }
 
 func()

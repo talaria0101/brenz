@@ -1,60 +1,11 @@
-//! Backend for our language server
-use tower_lsp::Client;
+//! Parsing related methods for Backend
+
+use super::Backend;
 use tower_lsp::lsp_types::*;
-use tree_sitter::{Parser, Tree, Node};
+use tree_sitter::Tree;
 use std::collections::HashMap;
-use std::path::PathBuf;
-use tokio::sync::Mutex;
-use std::fmt::Debug;
-
-use crate::brace::BracketChecker;
-
-pub struct Backend {
-    /// The tower_lsp::Client instance
-    pub client: Client,
-    /// The BracketChecker instance
-    ///
-    /// TODO: Give this guy a better name, merge requests are welcome
-    checker: Mutex<BracketChecker>,
-    /// The Parser instance
-    parser: Mutex<Parser>,
-    /// Your workspace/project folder
-    pub workspace_root: Mutex<Option<PathBuf>>,
-    /// Stores parsed trees for each document
-    pub trees: Mutex<HashMap<Url, Tree>>,
-    /// Function Definitions
-    pub fn_defs: Mutex<HashMap<Url, HashMap<String, Range>>>,
-    /// For storing text content of scripts
-    pub docs_content: Mutex<HashMap<Url, String>>,
-}
-
-impl Debug for Backend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Backend")
-        .field("client", &self.client)
-        .field("trees", &self.trees)
-        .finish()
-    }
-}
 
 impl Backend {
-    pub fn new(client: Client) -> Self
-    {
-        let language = tree_sitter_gsc::LANGUAGE.into();
-        let mut parser = Parser::new();
-        parser.set_language(&language).expect("Error loading GSC language");
-
-        Self {
-            client,
-            checker: Mutex::new(BracketChecker::new()),
-            parser: Mutex::new(parser),
-            workspace_root: Mutex::new(None),
-            trees: Mutex::new(HashMap::new()),
-            fn_defs: Mutex::new(HashMap::new()),
-            docs_content: Mutex::new(HashMap::new()),
-        }
-    }
-
     pub async fn parse_and_diagnose(&self, uri: Url, text: &str)
     {
         let mut checker = self.checker.lock().await;
@@ -228,93 +179,6 @@ impl Backend {
         }
     }
 
-    /// Get function definitions from parsed trees
-    fn extract_fns(&self, tree: &Tree, source: &str) -> HashMap<String, Range>
-    {
-        let mut fns: HashMap<String, Range> = HashMap::new();
-        let root = tree.root_node();
-        let mut cursor = root.walk();
-
-        for child in root.children(&mut cursor) {
-            // First child should be function name identifier
-            if let Some(name_node) = child.child(0) {
-                if name_node.kind() == "identifier" {
-                    let name = &source[name_node.start_byte()..name_node.end_byte()];
-                    let range = Range {
-                        start: self.byte_to_position(source, name_node.start_byte()),
-                        end: self.byte_to_position(source, name_node.end_byte()),
-                    };
-
-                    fns.insert(name.to_string(), range);
-                }
-            }
-        }
-        fns
-    }
-
-    /// Helper to find node at position
-    pub fn node_at_pos<'a>(&self, tree: &'a Tree, source: &str, position: Position) -> Option<Node<'a>>
-    {
-        let byte_offset = self.position_to_byte(source, position);
-        let root = tree.root_node();
-
-        /*match  {
-            Ok(n) => Some(n),
-            Err(e) => {
-                self.client.log_message(MessageType::LOG, format!("No node at {:?}", position));
-                None
-            }
-        }*/
-
-        root.descendant_for_byte_range(byte_offset, byte_offset)
-    }
-
-    pub fn find_parent_of_kind<'a>(&self, mut node: Node<'a>, kind: &str) -> Option<Node<'a>>
-    {
-        loop {
-            if node.kind() == kind {
-                return Some(node);
-            }
-            node = node.parent()?;
-        }
-    }
-
-    pub fn find_child_of_kind<'a>(&self, node: Node<'a>, kind: &str) -> Option<Node<'a>>
-    {
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if child.kind() == kind {
-                return Some(child);
-            }
-        }
-        None
-    }
-
-    /**
-     Returns
-     - `path` of the script (if exists)
-     - `name` of the script
-     - `function` called or referenced
-
-     of a `foreign_func_ref` or `foreign_call_expression` node
-    **/
-    pub fn process_foreign_fn(&self, node: Node, source: &str) -> Option<(Option<String>, String, String)>
-    {
-        let path = match node.child_by_field_name("path") {
-            Some(p) => {
-                Some(&source[p.start_byte()..p.end_byte()].to_string())
-            }
-            None => None,
-        };
-        let script_node = node.child_by_field_name("script")?;
-        let function_node = node.child_by_field_name("function")?;
-
-        let script_name = &source[script_node.start_byte()..script_node.end_byte()];
-        let function_name = &source[function_node.start_byte()..function_node.end_byte()];
-
-        Some((path.cloned(), script_name.to_string(), function_name.to_string()))
-    }
-
     /// Some editors (including kate) might not show a red underline at EOL.
     /// So, we need to adjust the char range to underline.
     fn adjust_range_for_visibility(&self, source: &str, start: Position, end: Position) -> (Position, Position)
@@ -362,48 +226,27 @@ impl Backend {
         (start, end)
     }
 
-    fn byte_to_position(&self, source: &str, byte_offset: usize) -> Position
+    /// Get function definitions from parsed trees
+    fn extract_fns(&self, tree: &Tree, source: &str) -> HashMap<String, Range>
     {
-        let mut line = 0;
-        let mut character = 0;
+        let mut fns: HashMap<String, Range> = HashMap::new();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
 
-        for (i, ch) in source.char_indices() {
-            if i >= byte_offset {
-                break;
-            }
+        for child in root.children(&mut cursor) {
+            // First child should be function name identifier
+            if let Some(name_node) = child.child(0) {
+                if name_node.kind() == "identifier" {
+                    let name = &source[name_node.start_byte()..name_node.end_byte()];
+                    let range = Range {
+                        start: self.byte_to_position(source, name_node.start_byte()),
+                        end: self.byte_to_position(source, name_node.end_byte()),
+                    };
 
-            if ch == '\n' {
-                line += 1;
-                character = 0;
-            } else {
-                character += 1;
+                    fns.insert(name.to_string(), range);
+                }
             }
         }
-
-        Position { line, character }
-    }
-
-    fn position_to_byte(&self, source: &str, position: Position) -> usize
-    {
-        let mut byte_offset = 0;
-        let mut current_line = 0;
-        let mut current_char = 0;
-
-        for ch in source.chars() {
-            if current_line == position.line && current_char == position.character {
-                return byte_offset;
-            }
-
-            if ch == '\n' {
-                current_line += 1;
-                current_char = 0;
-            } else {
-                current_char += 1;
-            }
-
-            byte_offset += ch.len_utf8();
-        }
-
-        byte_offset
+        fns
     }
 }

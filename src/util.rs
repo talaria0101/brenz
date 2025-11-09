@@ -56,7 +56,9 @@ pub(crate) fn now_fmt() -> String
     )
 }
 
-pub(crate) fn resolove_scr_path(root: &Option<PathBuf>, scr_path: Option<String>, script: String) -> io::Result<PathBuf>
+pub(crate) fn resolove_scr_path(
+    root: &Option<PathBuf>, scr_path: Option<String>, script: String
+) -> io::Result<PathBuf>
 {
     let wd = &std::env::current_dir()?;
     let base = root.as_ref().unwrap_or(wd);

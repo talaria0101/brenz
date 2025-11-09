@@ -130,52 +130,12 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
 
-        if let Some(direct_call) = self.find_parent_of_kind(node, "direct_call") {
-            //self.client.log_message(MessageType::INFO, format!("me: {}, child: {:#?}", direct_call.kind(), direct_call.child_by_field_name("path"))).await;
-
-            // Direct call to foreign function
-            if let Some(foreign_ref) = self.find_child_of_kind(direct_call, "foreign_function_ptr") {
-                logprint!(LogType::Info, "foreign");
-                match self.process_foreign_fn(foreign_ref, src) {
-                    Some((p, s, f)) => {
-                        logprint!(LogType::Info, "past processing: {:#?}, {}, {}", &p, &s, &f);
-                        let root = self.workspace_root.lock().await;
-                        match util::resolove_scr_path(&root, p, s) {
-                            Ok(r) => {
-                                logprint!(LogType::Info, "past resolove_path: {:#?}", &r);
-                                let s_uri = Url::from_file_path(r).unwrap();
-                                let fn_defs = self.fn_defs.lock().await;
-                                if let Some(funcs) = fn_defs.get(&s_uri) {
-                                    if let Some(range) = funcs.get(&f) {
-                                        return Ok(Some(GotoDefinitionResponse::Scalar(Location {
-                                            uri: s_uri,
-                                            range: *range,
-                                        })));
-                                    }
-                                }
-                            },
-                            Err(e) => {
-                                util::logprint!(LogType::Error, "Can't determine script path: {e}");
-                                self.client.log_message(MessageType::ERROR, format!("Can't determine script path: {e}")).await;
-                            }
-                        };
-                    }
-                    None => {}
-                };
-            }
-
-            // Direct call to local function
-            if let Some(func) = direct_call.child_by_field_name("function") {
-                let fn_name = &src[func.start_byte()..func.end_byte()];
-                let fn_defs = self.fn_defs.lock().await;
-                if let Some(funcs) = fn_defs.get(&uri) {
-                    if let Some(range) = funcs.get(fn_name) {
-                        return Ok(Some(GotoDefinitionResponse::Scalar(Location {
-                            uri: uri,
-                            range: *range,
-                        })));
-                    }
-                }
+        if let Some(call_node) = self.find_parent_of_kind(node, "direct_call")
+            .or_else(|| self.find_parent_of_kind(node, "thread_call"))
+            .or_else(|| self.find_parent_of_kind(node, "object_call"))
+        {
+            if let Some(location) = self.resolve_call_target(call_node, src, &uri).await {
+                return Ok(Some(GotoDefinitionResponse::Scalar(location)));
             }
         }
         //self.client.log_message(MessageType::INFO, format!("functions: {:#?}", self.fn_defs.lock().await)).await;
