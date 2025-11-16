@@ -1,12 +1,15 @@
 //! Parsing related methods for Backend
 
+use crate::util::{logprint, LogType};
+
+use tower_lsp_server as tower_lsp;
 use super::Backend;
 use tower_lsp::lsp_types::*;
 use tree_sitter::Tree;
 use std::collections::HashMap;
 
 impl Backend {
-    pub async fn parse_and_diagnose(&self, uri: Url, text: &str)
+    pub async fn parse_and_diagnose(&self, uri: Uri, text: &str)
     {
         let mut checker = self.checker.lock().await;
         let bracket_errors = checker.check(text);
@@ -55,11 +58,14 @@ impl Backend {
                         }
                     }
                 }
+                else {
+                    let fns = self.extract_fns(&tree, text);
+                    self.fn_defs.lock().await.insert(uri.clone(), fns);
+                    let syms = self.extract_syms(&tree, text);
+                    self.sym_defs.lock().await.insert(uri.clone(), syms);
+                }
 
-                self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
-
-                let fns = self.extract_fns(&tree, text);
-                self.fn_defs.lock().await.insert(uri, fns);
+                self.client.publish_diagnostics(uri, diagnostics, None).await;
             }
             None => {
                 let diagnostic = Diagnostic {
@@ -227,26 +233,121 @@ impl Backend {
     }
 
     /// Get function definitions from parsed trees
-    fn extract_fns(&self, tree: &Tree, source: &str) -> HashMap<String, Range>
+    fn extract_fns(&self, tree: &Tree, source: &str) -> HashMap<String, (Range, Option<String>)>
     {
-        let mut fns: HashMap<String, Range> = HashMap::new();
+        let mut fns: HashMap<String, (Range, Option<String>)> = HashMap::new();
         let root = tree.root_node();
         let mut cursor = root.walk();
 
         for child in root.children(&mut cursor) {
             // First child should be function name identifier
-            if let Some(name_node) = child.child(0) {
-                if name_node.kind() == "identifier" {
-                    let name = &source[name_node.start_byte()..name_node.end_byte()];
-                    let range = Range {
-                        start: self.byte_to_position(source, name_node.start_byte()),
-                        end: self.byte_to_position(source, name_node.end_byte()),
-                    };
+            if let Some(func_head) = child.child_by_field_name("func_head") {
+                if let Some(name_node) = func_head.child(0) {
+                    if name_node.kind() == "identifier" {
+                        let name = &source[name_node.start_byte()..name_node.end_byte()];
+                        let range = Range {
+                            start: self.byte_to_position(source, func_head.start_byte()),
+                            end: self.byte_to_position(source, func_head.end_byte()),
+                        };
 
-                    fns.insert(name.to_string(), range);
+                        let comment = match child.prev_sibling() {
+                            Some(ps) => {
+                                if ps.kind() == "comment" {
+                                    Some(source[ps.start_byte()..ps.end_byte()].to_string())
+                                }
+                                else { None }
+                            }
+                            None => None
+                        };
+
+                        logprint!(LogType::Info, "Name: {}, Function: {}, Comment: {:?}", name, &source[func_head.start_byte()..func_head.end_byte()], &comment.as_ref());
+
+                        fns.insert(name.to_string(), (range, comment));
+                    }
                 }
             }
         }
         fns
+    }
+
+    fn extract_syms(&self, tree: &Tree, src: &str) -> Vec<DocumentSymbol>
+    {
+        let mut symbols: Vec<DocumentSymbol> = Vec::new();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+
+        for child in root.children(&mut cursor) {
+            if child.kind() == "function_definition" {
+                let mut vars: Vec<DocumentSymbol> = Vec::new();
+
+                if let Some(func_block) = child.child_by_field_name("func_block") {
+                    logprint!(LogType::Info, "in func_block");
+                    let assign_exprs = self.find_children_of_kind(func_block, "assignment_expression");
+                    logprint!(LogType::Info, "assign_exprs: {:#?}", assign_exprs.clone());
+                    let mut done: Vec<&str> = Vec::new();
+
+                    let _ = assign_exprs.into_iter().map(|expr| {
+                        if let Some(var) = expr.child_by_field_name("variable") {
+                            let var_name = &src[var.start_byte()..var.end_byte()];
+                            // don't want dups in symbol tree
+                            if done.contains(&var_name) {
+                                return;
+                            }
+
+                            let sym = DocumentSymbol {
+                                name: var_name.to_string(),
+                                detail: None,
+                                kind: SymbolKind::VARIABLE,
+                                tags: None,
+                                #[allow(deprecated)]
+                                deprecated: None,
+                                range: Range {
+                                    start: self.byte_to_position(&src, expr.start_byte()),
+                                end: self.byte_to_position(&src, expr.end_byte()),
+                                },
+                                selection_range:Range {
+                                    start: self.byte_to_position(&src, var.start_byte()),
+                                end: self.byte_to_position(&src, var.end_byte()),
+                                },
+                                children: None
+                            };
+
+                            logprint!(LogType::Info, "Symbol: {:#?}", sym.clone());
+
+                            vars.push(sym);
+
+                            done.push(var_name);
+                        }
+                    });
+                }
+
+                if let Some(func_head) = child.child_by_field_name("func_head") {
+                    if let Some(name_node) = func_head.child(0) {
+                        let name = &src[name_node.start_byte()..name_node.end_byte()];
+                        let detail = &src[func_head.start_byte()..func_head.end_byte()];
+
+                        symbols.push(DocumentSymbol {
+                            name: name.to_string(),
+                            detail: Some(detail.to_string()),
+                            kind: SymbolKind::FUNCTION,
+                            tags: None,
+                            #[allow(deprecated)]
+                            deprecated: None, // screw it
+                            range: Range {
+                                start: self.byte_to_position(&src, child.start_byte()),
+                            end: self.byte_to_position(&src, child.end_byte()),
+                            },
+                            selection_range: Range {
+                                start: self.byte_to_position(&src, func_head.start_byte()),
+                            end: self.byte_to_position(&src, func_head.end_byte()),
+                            },
+                            children: Some(vars),
+                        });
+                    }
+                }
+            }
+        }
+
+        symbols
     }
 }

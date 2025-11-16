@@ -1,4 +1,5 @@
 //! Backend for our language server
+use tower_lsp_server as tower_lsp;
 use tower_lsp::Client;
 use tower_lsp::lsp_types::*;
 use tree_sitter::{Parser, Tree};
@@ -21,11 +22,13 @@ pub struct Backend {
     /// Your workspace/project folder
     pub workspace_root: Mutex<Option<PathBuf>>,
     /// Stores parsed trees for each document
-    pub trees: Mutex<HashMap<Url, Tree>>,
+    pub trees: Mutex<HashMap<Uri, Tree>>,
     /// Function Definitions
-    pub fn_defs: Mutex<HashMap<Url, HashMap<String, Range>>>,
+    pub fn_defs: Mutex<HashMap<Uri, HashMap<String, (Range, Option<String>)>>>,
+    /// Symbols
+    pub sym_defs: Mutex<HashMap<Uri, Vec<DocumentSymbol>>>,
     /// For storing text content of scripts
-    pub docs_content: Mutex<HashMap<Url, String>>,
+    pub docs_content: Mutex<HashMap<Uri, String>>,
 }
 
 impl Debug for Backend {
@@ -51,6 +54,7 @@ impl Backend {
             workspace_root: Mutex::new(None),
             trees: Mutex::new(HashMap::new()),
             fn_defs: Mutex::new(HashMap::new()),
+            sym_defs: Mutex::new(HashMap::new()),
             docs_content: Mutex::new(HashMap::new()),
         }
     }

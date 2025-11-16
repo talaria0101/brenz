@@ -2,6 +2,7 @@
 //!
 //! Mostly done by Claude
 
+use tower_lsp_server as tower_lsp;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 #[derive(Debug, Clone)]

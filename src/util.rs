@@ -61,6 +61,7 @@ pub(crate) fn resolove_scr_path(
 ) -> io::Result<PathBuf>
 {
     let wd = &std::env::current_dir()?;
+    logprint!(LogType::Info, "WD: {}", &wd.to_str().unwrap());
     let base = root.as_ref().unwrap_or(wd);
     match scr_path {
         Some(p) => {

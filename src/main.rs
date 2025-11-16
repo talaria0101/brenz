@@ -1,4 +1,4 @@
-use async_trait::async_trait;
+use tower_lsp_server as tower_lsp;
 use clap::Parser;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{LanguageServer, LspService, Server, jsonrpc};
@@ -11,27 +11,24 @@ mod interpreter;
 mod util;
 use util::{logprint, LogType};
 
-#[async_trait]
+//#[async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult, jsonrpc::Error>
     {
         // Thanks to Claude for helping with workspace root
-        let workspace_root = params.root_uri
-        .as_ref()
-        .and_then(|uri| Some(PathBuf::from(uri.path())))
-        .or_else(|| {
-            params.root_uri
-            .as_ref()
-            .map(|p| PathBuf::from(p.path()))
-        })
-        .or_else(|| {
-            logprint!(LogType::Info, "using fallback workspace");
-            // Try workspace_folders as fallback
-            params.workspace_folders
+        self.client.log_message(
+            MessageType::LOG, format!("Workspace folders: {:#?}", params.workspace_folders.as_ref())
+        ).await;
+        let workspace_root = params.workspace_folders
             .as_ref()
             .and_then(|folders| folders.first())
-            .and_then(|folder| PathBuf::from(folder.uri.path()).parent().map(|p| p.to_path_buf()))
-        });
+            .and_then(|folder| {
+                Some(PathBuf::from(folder.uri.path().as_str()))
+            })
+            .or_else(|| {
+                #[allow(deprecated)]
+                params.root_uri.and_then(|u| Some(PathBuf::from(u.path().as_str())))
+            });
 
         if let Some(root) = &workspace_root {
             self.client.log_message(
@@ -45,6 +42,7 @@ impl LanguageServer for Backend {
         logprint!(LogType::Info, "Brenz initializing");
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                document_symbol_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(true.into()),
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
                 definition_provider: Some(OneOf::Left(true)),
@@ -58,6 +56,7 @@ impl LanguageServer for Backend {
     {
         logprint!(LogType::Success, "Brenz initialized");
         self.client.log_message(MessageType::INFO, "Brenz: Server Initialized").await;
+        logprint!(LogType::Info, "Workspace: {:?}", self.workspace_root.lock().await);
     }
 
     async fn shutdown(&self) -> Result<(), tower_lsp::jsonrpc::Error>
@@ -68,7 +67,7 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams)
     {
-        self.client.log_message(MessageType::INFO,format!("Opened: {}", params.text_document.uri)).await;
+        self.client.log_message(MessageType::INFO,format!("Opened: {}", params.text_document.uri.as_str())).await;
 
         // Parse the newly opened document
         self.parse_and_diagnose(params.text_document.uri.clone(), &params.text_document.text).await;
@@ -80,7 +79,7 @@ impl LanguageServer for Backend {
     {
         // For full sync, we get the entire document content
         if let Some(change) = params.content_changes.first() {
-            self.client.log_message(MessageType::INFO, format!("Changed: {}", params.text_document.uri)).await;
+            self.client.log_message(MessageType::INFO, format!("Changed: {}", params.text_document.uri.as_str())).await;
 
             // Re-parse the changed document
             self.parse_and_diagnose(params.text_document.uri.clone(), &change.text).await;
@@ -106,6 +105,7 @@ impl LanguageServer for Backend {
         self.trees.lock().await.remove(&params.text_document.uri);
         self.docs_content.lock().await.remove(&params.text_document.uri);
         self.client.publish_diagnostics(params.text_document.uri, vec![], None).await;
+        // not clearing the fn_defs for this file
     }
 
     async fn goto_definition(
@@ -115,17 +115,76 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
 
-        let trees = self.trees.lock().await;
-        let tree = match trees.get(&uri) {
-            Some(t) => t,
-            None => return Ok(None),
+        let (tree, src) = {
+            let trees = self.trees.lock().await;
+            let tree = match trees.get(&uri) {
+                Some(t) => t.clone(),
+                None => return Ok(None),
+            };
+
+            let dc = self.docs_content.lock().await;
+            let src = match dc.get(&uri) {
+                Some(s) => s.clone(),
+                None => return Ok(None),
+            };
+
+            (tree, src)
         };
 
-        let dc = self.docs_content.lock().await;
-        let src = dc.get(&uri).unwrap();
-
-        let node = self.node_at_pos(tree, src, pos).unwrap();
+        let node = self.node_at_pos(&tree, &src, pos).unwrap();
         //self.client.log_message(MessageType::INFO, format!("kind: {}, field: {}", node.kind(), node.parent().unwrap().kind())).await;
+        if node.kind() != "identifier" {
+            return Ok(None);
+        }
+
+        if let Some(fn_node) = self.find_parent_of_kind(node, "direct_call")
+            .or_else(|| self.find_parent_of_kind(node, "thread_call"))
+            .or_else(|| self.find_parent_of_kind(node, "object_call"))
+            .or_else(|| self.find_parent_of_kind(node, "function_pointer"))
+        {
+            logprint!(LogType::Info, "in a call_node");
+            if let Some(res) = self.resolve_target_fn(fn_node, &src, &uri, false).await {
+                return Ok(Some(GotoDefinitionResponse::Scalar(res.0)));
+            }
+        }
+
+        let identifier = &src[node.start_byte()..node.end_byte()];
+        if let Some(assignment_node) = self.find_var_def(identifier, node, &src) {
+            let range = Range {
+                start: self.byte_to_position(&src, assignment_node.start_byte()),
+                end: self.byte_to_position(&src, assignment_node.end_byte()),
+            };
+            return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                uri: uri,
+                range: range
+            })));
+        }
+
+        Ok(None)
+    }
+
+    async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>>
+    {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+
+        let (tree, src) = {
+            let trees = self.trees.lock().await;
+            let tree = match trees.get(&uri) {
+                Some(t) => t.clone(),
+                None => return Ok(None),
+            };
+
+            let dc = self.docs_content.lock().await;
+            let src = match dc.get(&uri) {
+                Some(s) => s.clone(),
+                None => return Ok(None),
+            };
+
+            (tree, src)
+        };
+
+        let node = self.node_at_pos(&tree, &src, pos).unwrap();
         if node.kind() != "identifier" {
             return Ok(None);
         }
@@ -133,14 +192,46 @@ impl LanguageServer for Backend {
         if let Some(call_node) = self.find_parent_of_kind(node, "direct_call")
             .or_else(|| self.find_parent_of_kind(node, "thread_call"))
             .or_else(|| self.find_parent_of_kind(node, "object_call"))
+            .or_else(|| self.find_parent_of_kind(node, "function_pointer"))
         {
-            if let Some(location) = self.resolve_call_target(call_node, src, &uri).await {
-                return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+            logprint!(LogType::Info, "(hover) in a call_node");
+            match self.resolve_target_fn(call_node, &src, &uri, true).await {
+                Some(res) => {
+                    let txt = self.hover_info(res, uri).await
+                        .unwrap_or(String::from("Failed to get hover info"));
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Scalar(MarkedString::String(txt)),
+                        range: None
+                    }));
+                }
+                None => {
+                    logprint!(LogType::Error, "Failed to resolve_target_fn");
+                }
             }
         }
-        //self.client.log_message(MessageType::INFO, format!("functions: {:#?}", self.fn_defs.lock().await)).await;
 
-        Ok(None)
+        Ok(Some(Hover {
+            contents: HoverContents::Scalar(MarkedString::String(
+                "We're not there yet.\n[Contribute :)](https://gitlab.com/kazam0180/brenz)".to_string()
+            )),
+            range: None
+        }))
+    }
+
+    async fn document_symbol(
+        &self, params: DocumentSymbolParams
+    ) ->jsonrpc::Result<Option<DocumentSymbolResponse>>
+    {
+        let uri = params.text_document.uri;
+        let symbols = match self.get_syms(&uri).await {
+            Some(syms) => syms,
+            None => {
+                logprint!(LogType::Error, "Failed to get document symbols for file: {}", uri.path().as_str());
+                Vec::new()
+            }
+        };
+
+        Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 }
 

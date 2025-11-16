@@ -1,5 +1,7 @@
 //! Helper methods for Backend
 
+use tower_lsp_server as tower_lsp;
+
 use super::Backend;
 use tower_lsp::lsp_types::*;
 use tree_sitter::{Node, Tree};
@@ -57,5 +59,56 @@ impl Backend {
         }
 
         byte_offset
+    }
+
+    pub(crate) async fn get_function(
+        &self, uri: &Uri, name: String, comment: bool
+    ) -> Option<(Range, Option<String>)>
+    {
+        let fn_defs = self.fn_defs.lock().await;
+        let func = fn_defs.get(&uri)?;
+        let rng = func.get(&name)?.0;
+        let cmt = if comment {
+            func.get(&name)?.1.clone()
+        } else { None };
+
+        Some((rng, cmt))
+    }
+
+    pub(crate) async fn hover_info(&self, data: (Location, Option<String>), current_uri: Uri) -> Option<String>
+    {
+        let location = data.0;
+        let tsrc = {
+            let dc = self.docs_content.lock().await;
+            dc.get(&location.uri)?.clone()
+        };
+
+        let start = self.position_to_byte(&tsrc, location.range.start);
+        let end = self.position_to_byte(&tsrc, location.range.end);
+        let func = tsrc[start..end].to_string();
+
+        let mut txt = String::new();
+        txt.push_str(&format!("{func}\n___\n"));
+        if location.uri != current_uri {
+            txt.push_str(&format!("File: ``{}``\n___\n", location.uri.path().as_str()));
+        }
+        if let Some(cmt) = data.1 {
+            txt.push_str(&format!("{}", cmt));
+        }
+
+        if txt.trim().len() != 0 {
+            return Some(txt);
+        }
+
+        None
+    }
+
+    pub(crate) async fn get_syms(&self, uri: &Uri) -> Option<Vec<DocumentSymbol>>
+    {
+        let sym_defs = self.sym_defs.lock().await;
+        match sym_defs.get(uri) {
+            Some(defs) => Some(defs.clone()),
+            None => None
+        }
     }
 }

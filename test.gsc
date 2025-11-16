@@ -17,16 +17,25 @@ main()
     level thread [[ref]]();
     [[ref]]();
     vec = (1, 2, array[1]);*/
+    a = 1;
+    a = a + 2;
     self thread func();
     level thread test2::another_func();
     another_func();
     thread folder\test3::func_in_test3();
+    ref = folder\test3::func_in_test3;
+    [[ref]]();
+
+    for(i=0; i<player.size; i++) {}
 }
 
+// this is func
 func()
 {}
 
-another_func()
+another_func(name, age,
+             a1, b1
+)
 {}
 
 //another_func()
