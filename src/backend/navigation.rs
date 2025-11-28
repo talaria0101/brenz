@@ -30,7 +30,7 @@ impl Backend {
         None
     }
 
-    pub fn find_children_of_kind<'a>(&self, node: Node<'a>, kind: &str) -> Vec<Node<'a>>
+    /*pub fn find_children_of_kind<'a>(&self, node: Node<'a>, kind: &str) -> Vec<Node<'a>>
     {
         let mut children: Vec<Node> = Vec::new();
         let mut cursor = node.walk();
@@ -41,6 +41,18 @@ impl Backend {
         }
 
         children
+    }*/
+
+    pub fn find_descendants_of_kind<'a>(&self, node: Node<'a>, kind: &str, results: &mut Vec<Node<'a>>)
+    {
+        if node.kind() == kind {
+            results.push(node);
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.find_descendants_of_kind(child, kind, results);
+        }
     }
 
     /**

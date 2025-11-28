@@ -27,6 +27,7 @@ main()
     [[ref]]();
 
     for(i=0; i<player.size; i++) {}
+    wait game[secs];
 }
 
 // this is func

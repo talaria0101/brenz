@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use std::fmt::Debug;
 
 use crate::brace::BracketChecker;
+use crate::doc::Builtins;
 
 pub struct Backend {
     /// The tower_lsp::Client instance
@@ -29,6 +30,8 @@ pub struct Backend {
     pub sym_defs: Mutex<HashMap<Uri, Vec<DocumentSymbol>>>,
     /// For storing text content of scripts
     pub docs_content: Mutex<HashMap<Uri, String>>,
+    /// Builtin functions and methods
+    pub builtins_doc: Mutex<Builtins>,
 }
 
 impl Debug for Backend {
@@ -56,6 +59,7 @@ impl Backend {
             fn_defs: Mutex::new(HashMap::new()),
             sym_defs: Mutex::new(HashMap::new()),
             docs_content: Mutex::new(HashMap::new()),
+            builtins_doc: Mutex::new(Builtins::new()),
         }
     }
 }

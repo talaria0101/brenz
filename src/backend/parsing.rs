@@ -282,16 +282,17 @@ impl Backend {
 
                 if let Some(func_block) = child.child_by_field_name("func_block") {
                     logprint!(LogType::Info, "in func_block");
-                    let assign_exprs = self.find_children_of_kind(func_block, "assignment_expression");
+                    let mut assign_exprs = Vec::new();
+                    self.find_descendants_of_kind(func_block, "assignment_expression", &mut assign_exprs);
                     logprint!(LogType::Info, "assign_exprs: {:#?}", assign_exprs.clone());
-                    let mut done: Vec<&str> = Vec::new();
+                    let mut done: Vec<String> = Vec::new();
 
-                    let _ = assign_exprs.into_iter().map(|expr| {
+                    for expr in assign_exprs.into_iter() {
                         if let Some(var) = expr.child_by_field_name("variable") {
                             let var_name = &src[var.start_byte()..var.end_byte()];
                             // don't want dups in symbol tree
-                            if done.contains(&var_name) {
-                                return;
+                            if done.contains(&var_name.to_string()) {
+                                continue;
                             }
 
                             let sym = DocumentSymbol {
@@ -316,9 +317,9 @@ impl Backend {
 
                             vars.push(sym);
 
-                            done.push(var_name);
+                            done.push(var_name.to_string());
                         }
-                    });
+                    }
                 }
 
                 if let Some(func_head) = child.child_by_field_name("func_head") {

@@ -1,4 +1,5 @@
 use chrono::{Local, Datelike, Timelike};
+use std::fs::create_dir_all;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -86,6 +87,16 @@ pub(crate) fn init_cfg() -> io::Result<PathBuf>
 # In future, it will be used for configuration like `.clangd` for clangd server.
 "#;
     std::fs::write(f, content)?;
+
+    Ok(base)
+}
+
+pub(crate) fn get_data_dir() -> io::Result<PathBuf>
+{
+    let base = std::env::home_dir().unwrap().join(".local/share/brenz");
+    if !base.exists() {
+        create_dir_all(&base)?;
+    }
 
     Ok(base)
 }

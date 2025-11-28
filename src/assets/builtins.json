@@ -1,0 +1,35 @@
+{
+  "functions": {
+    "iprintln": {
+      "sign": "iprintln(message)",
+      "info": "Prints a message to the player's obituary",
+      "params": [
+        {
+          "name": "message",
+          "type": "string",
+          "info": "The message to print"
+        }
+      ],
+      "returns": null,
+      "example": "iPrintLn(\"Hello!\");"
+    },
+    "spawn": {
+      "sign": "spawn(classname, origin)",
+      "info": "Spawns an entity at the specified location",
+      "params": [
+        {
+          "name": "classname",
+          "type": "string",
+          "info": "Entity class name"
+        },
+        {
+          "name": "origin",
+          "type": "vector",
+          "info": "Position to spawn at"
+        }
+      ],
+      "returns": "entity",
+      "example": "ent = spawn(\"script_model\", (0, 0, 0));"
+    }
+  }
+}

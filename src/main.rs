@@ -10,11 +10,15 @@ mod brace;
 mod interpreter;
 mod util;
 use util::{logprint, LogType};
+mod doc;
 
-//#[async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult, jsonrpc::Error>
     {
+        self.unpack_docs();
+        self.load_docs().await;
+        let m = &self.builtins_doc.lock().await.functions;
+        logprint!(LogType::Info, "{}", serde_json::to_string_pretty(m).unwrap());
         // Thanks to Claude for helping with workspace root
         self.client.log_message(
             MessageType::LOG, format!("Workspace folders: {:#?}", params.workspace_folders.as_ref())
@@ -185,8 +189,56 @@ impl LanguageServer for Backend {
         };
 
         let node = self.node_at_pos(&tree, &src, pos).unwrap();
+        match node.kind() {
+            "wait" => {
+                let txt = doc::strings::WAIT_INFO.to_string();
+                return Ok(Some(Hover {
+                    contents: HoverContents::Scalar(MarkedString::String(txt)),
+                               range: None
+                }));
+            }
+            "thread" => {
+                let txt = doc::strings::THREAD_INFO.to_string();
+                return Ok(Some(Hover {
+                    contents: HoverContents::Scalar(MarkedString::String(txt)),
+                               range: None
+                }));
+            }
+            _ => {}
+        }
+
+        // Only identifiers can go beyond this point
         if node.kind() != "identifier" {
+            let strr = &src[node.start_byte()..node.end_byte()];
+            self.client.log_message(MessageType::LOG, &format!("{}, {}", strr, node.kind())).await;
             return Ok(None);
+        }
+
+        let identifier = &src[node.start_byte()..node.end_byte()];
+        self.client.log_message(MessageType::LOG, &format!("identifier: {}", identifier)).await;
+        match identifier {
+            "self" => {
+                let txt = doc::strings::SELF_INFO.to_string();
+                return Ok(Some(Hover {
+                    contents: HoverContents::Scalar(MarkedString::String(txt)),
+                               range: None
+                }));
+            }
+            "level" => {
+                let txt = doc::strings::LEVEL_INFO.to_string();
+                return Ok(Some(Hover {
+                    contents: HoverContents::Scalar(MarkedString::String(txt)),
+                               range: None
+                }));
+            }
+            "game" => {
+                let txt = doc::strings::GAME_INFO.to_string();
+                return Ok(Some(Hover {
+                    contents: HoverContents::Scalar(MarkedString::String(txt)),
+                               range: None
+                }));
+            }
+            _ => {}
         }
 
         if let Some(call_node) = self.find_parent_of_kind(node, "direct_call")
@@ -224,7 +276,10 @@ impl LanguageServer for Backend {
     {
         let uri = params.text_document.uri;
         let symbols = match self.get_syms(&uri).await {
-            Some(syms) => syms,
+            Some(syms) => {
+                logprint!(LogType::Info, "Symobols: {:#?}", syms.clone());
+                syms
+            }
             None => {
                 logprint!(LogType::Error, "Failed to get document symbols for file: {}", uri.path().as_str());
                 Vec::new()
