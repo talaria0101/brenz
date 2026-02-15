@@ -1,35 +1,43 @@
 {
   "functions": {
-    "iprintln": {
-      "sign": "iprintln(message)",
-      "info": "Prints a message to the player's obituary",
+    "isDefined": {
+      "sign": "isDefined(var)",
+      "info": "Check if a variable is defined or not",
       "params": [
-        {
-          "name": "message",
-          "type": "string",
-          "info": "The message to print"
-        }
+        { "name": "variable", "type": "any", "info": "The variable to check" }
       ],
-      "returns": null,
-      "example": "iPrintLn(\"Hello!\");"
+      "returns": "bool",
+      "example": "if (!isDefined(myVar))\n    return;"
     },
     "spawn": {
       "sign": "spawn(classname, origin)",
       "info": "Spawns an entity at the specified location",
       "params": [
-        {
-          "name": "classname",
-          "type": "string",
-          "info": "Entity class name"
-        },
-        {
-          "name": "origin",
-          "type": "vector",
-          "info": "Position to spawn at"
-        }
+        { "name": "classname", "type": "string", "info": "Entity class name" },
+        { "name": "origin", "type": "vector", "info": "Position to spawn at" }
       ],
       "returns": "entity",
       "example": "ent = spawn(\"script_model\", (0, 0, 0));"
+    }
+  },
+  "methods": {
+    "iPrintLn": {
+      "sign": "iPrintLn(message)",
+      "info": "Prints a message to the player's obituary",
+      "called_on": "self",
+      "params": [
+        { "name": "message", "type": "string", "info": "The message to print" }
+      ],
+      "returns": null,
+      "example": "player iPrintLn(\"Hello player!\");\nlevel iPrintLn(\"Hello players!\");"
+    },
+    "suicide": {
+      "sign": "suicide()",
+      "info": "Kills the player immediately as a suicide",
+      "called_on": "player",
+      "params": [],
+      "returns": null,
+      "example": "self suicide();"
     }
   }
 }

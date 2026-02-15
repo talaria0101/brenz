@@ -17,8 +17,12 @@ impl LanguageServer for Backend {
     {
         self.unpack_docs();
         self.load_docs().await;
-        let m = &self.builtins_doc.lock().await.functions;
-        logprint!(LogType::Info, "{}", serde_json::to_string_pretty(m).unwrap());
+        let (f, m) = {
+            let b = self.builtins_doc.lock().await;
+            (b.functions.clone(), b.methods.clone())
+        };
+        logprint!(LogType::Info, "Builtin functions: \n{}", serde_json::to_string_pretty(&f).unwrap());
+        logprint!(LogType::Info, "Builtin methods: \n{}", serde_json::to_string_pretty(&m).unwrap());
         // Thanks to Claude for helping with workspace root
         self.client.log_message(
             MessageType::LOG, format!("Workspace folders: {:#?}", params.workspace_folders.as_ref())
@@ -190,19 +194,10 @@ impl LanguageServer for Backend {
 
         let node = self.node_at_pos(&tree, &src, pos).unwrap();
         match node.kind() {
-            "wait" => {
-                let txt = doc::strings::WAIT_INFO.to_string();
-                return Ok(Some(Hover {
-                    contents: HoverContents::Scalar(MarkedString::String(txt)),
-                               range: None
-                }));
-            }
-            "thread" => {
-                let txt = doc::strings::THREAD_INFO.to_string();
-                return Ok(Some(Hover {
-                    contents: HoverContents::Scalar(MarkedString::String(txt)),
-                               range: None
-                }));
+            "wait" | "thread" => {
+                if let Some(info) = self.identifier_hover_info(&src[node.start_byte()..node.end_byte()]) {
+                    return Ok(Some(info));
+                }
             }
             _ => {}
         }
@@ -216,29 +211,9 @@ impl LanguageServer for Backend {
 
         let identifier = &src[node.start_byte()..node.end_byte()];
         self.client.log_message(MessageType::LOG, &format!("identifier: {}", identifier)).await;
-        match identifier {
-            "self" => {
-                let txt = doc::strings::SELF_INFO.to_string();
-                return Ok(Some(Hover {
-                    contents: HoverContents::Scalar(MarkedString::String(txt)),
-                               range: None
-                }));
-            }
-            "level" => {
-                let txt = doc::strings::LEVEL_INFO.to_string();
-                return Ok(Some(Hover {
-                    contents: HoverContents::Scalar(MarkedString::String(txt)),
-                               range: None
-                }));
-            }
-            "game" => {
-                let txt = doc::strings::GAME_INFO.to_string();
-                return Ok(Some(Hover {
-                    contents: HoverContents::Scalar(MarkedString::String(txt)),
-                               range: None
-                }));
-            }
-            _ => {}
+
+        if let Some(info) = self.identifier_hover_info(identifier) {
+            return Ok(Some(info));
         }
 
         if let Some(call_node) = self.find_parent_of_kind(node, "direct_call")
@@ -247,6 +222,31 @@ impl LanguageServer for Backend {
             .or_else(|| self.find_parent_of_kind(node, "function_pointer"))
         {
             logprint!(LogType::Info, "(hover) in a call_node");
+            let builtin_info: String = {
+                let r = self.builtins_doc.lock().await;
+                logprint!(LogType::Info, "The identifier in question: {}", &identifier.to_lowercase());
+                logprint!(LogType::Info, "Builtin functions: {:#?}", r.functions.keys());
+                let b = r.methods.get(&identifier.to_ascii_lowercase());
+
+                if let Some(b) = b {
+                    self.info_from_builtin_mt(b)
+                }
+                else {
+                    let b = r.functions.get(&identifier.to_ascii_lowercase());
+                    if let Some(b) = b {
+                        self.info_from_builtin_fn(b)
+                    }
+                    else { String::new() }
+                }
+            };
+            if !builtin_info.is_empty() {
+                logprint!(LogType::Info, "txt: {}", &builtin_info);
+                return Ok(Some(Hover {
+                    contents: HoverContents::Scalar(MarkedString::String(builtin_info)),
+                    range: None
+                }));
+            }
+
             match self.resolve_target_fn(call_node, &src, &uri, true).await {
                 Some(res) => {
                     let txt = self.hover_info(res, uri).await
@@ -277,7 +277,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let symbols = match self.get_syms(&uri).await {
             Some(syms) => {
-                logprint!(LogType::Info, "Symobols: {:#?}", syms.clone());
+                //logprint!(LogType::Info, "Symobols: {:#?}", syms.clone());
                 syms
             }
             None => {
@@ -323,6 +323,7 @@ async fn main() {
     }
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
+    eprintln!("we are here");
 
     let (service, socket) = LspService::new(|client| Backend::new(client));
     Server::new(stdin, stdout, socket).serve(service).await;

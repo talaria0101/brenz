@@ -2,6 +2,8 @@
 
 use tower_lsp_server as tower_lsp;
 
+use crate::doc::{ScrFunction, ScrMethod};
+
 use super::Backend;
 use tower_lsp::lsp_types::*;
 use tree_sitter::{Node, Tree};
@@ -75,7 +77,29 @@ impl Backend {
         Some((rng, cmt))
     }
 
-    pub(crate) async fn hover_info(&self, data: (Location, Option<String>), current_uri: Uri) -> Option<String>
+    pub(crate) fn info_from_builtin_fn(&self, builtin: &ScrFunction) -> String
+    {
+        let mut txt = String::new();
+        txt.push_str(&format!("## `{}`\n___\n", &builtin.sign));
+        txt.push_str("Builtin Function\n___\n");
+        txt.push_str(&format!("{}\n___\nExample:\n", &builtin.info));
+        txt.push_str(&format!("```gsc\n{}\n```", &builtin.example));
+        txt
+    }
+
+    pub(crate) fn info_from_builtin_mt(&self, builtin: &ScrMethod) -> String
+    {
+        let mut txt = String::new();
+        txt.push_str(&format!("## `{}`\nCalled on: `{}`\n___\n", &builtin.sign, &builtin.called_on));
+        txt.push_str("Builtin Method\n___\n");
+        txt.push_str(&format!("{}\n___\nExample:\n", &builtin.info));
+        txt.push_str(&format!("```gsc\n{}\n```", &builtin.example));
+        txt
+    }
+
+    pub(crate) async fn hover_info(
+        &self, data: (Location, Option<String>), current_uri: Uri
+    ) -> Option<String>
     {
         let location = data.0;
         let tsrc = {

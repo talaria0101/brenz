@@ -142,7 +142,7 @@ impl Backend {
         // Check if node has missing children (incomplete parse)
         if node.has_error() && node.kind() != "ERROR" {
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
+                if let Some(child) = node.child(i.try_into().unwrap()) {
                     if child.is_missing() {
                         let start_pos = self.byte_to_position(source, child.start_byte());
                         let mut end_pos = self.byte_to_position(source, child.end_byte());
@@ -179,7 +179,7 @@ impl Backend {
 
         // Check children for errors
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
+            if let Some(child) = node.child(i.try_into().unwrap()) {
                 self.find_errors(&child, source, diagnostics);
             }
         }
@@ -260,7 +260,10 @@ impl Backend {
                             None => None
                         };
 
-                        logprint!(LogType::Info, "Name: {}, Function: {}, Comment: {:?}", name, &source[func_head.start_byte()..func_head.end_byte()], &comment.as_ref());
+                        logprint!(
+                            LogType::Info, "Name: {}, Function: {}, Comment: {:?}",
+                            name, &source[func_head.start_byte()..func_head.end_byte()], &comment.as_ref()
+                        );
 
                         fns.insert(name.to_string(), (range, comment));
                     }
@@ -296,7 +299,7 @@ impl Backend {
                             }
 
                             let sym = DocumentSymbol {
-                                name: var_name.to_string(),
+                                name: var_name.to_lowercase(),
                                 detail: None,
                                 kind: SymbolKind::VARIABLE,
                                 tags: None,
@@ -313,7 +316,7 @@ impl Backend {
                                 children: None
                             };
 
-                            logprint!(LogType::Info, "Symbol: {:#?}", sym.clone());
+                            //logprint!(LogType::Info, "Symbol: {:#?}", sym.clone());
 
                             vars.push(sym);
 
@@ -328,7 +331,7 @@ impl Backend {
                         let detail = &src[func_head.start_byte()..func_head.end_byte()];
 
                         symbols.push(DocumentSymbol {
-                            name: name.to_string(),
+                            name: name.to_lowercase(),
                             detail: Some(detail.to_string()),
                             kind: SymbolKind::FUNCTION,
                             tags: None,
