@@ -78,6 +78,44 @@ impl BracketChecker {
                         }
                     }
                 }
+                '/' if !in_string => {
+                    if chars.peek().map(|(_, c)| *c) == Some('/') {
+                        // Line comment - skip until next line
+                        chars.next(); // consume second '/'
+                        col += 1;
+                        while let Some((_, next_ch)) = chars.next() {
+                            if next_ch == '\n' {
+                                line += 1;
+                                col = 0;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    else if chars.peek().map(|(_, c)| *c) == Some('*') {
+                        // Block comment - skip until '*/'
+                        chars.next(); // consume '*'
+                        col += 1;
+                        while let Some((_, next_ch)) = chars.next() {
+                            if next_ch == '\n' {
+                                line += 1;
+                                col = 0;
+                            }
+                            else if next_ch == '*' {
+                                if chars.peek().map(|(_, c)| *c) == Some('/') {
+                                    // Block comment ended
+                                    chars.next(); // consume '/'
+                                    col += 1;
+                                    break;
+                                }
+                            }
+                            else {
+                                col += 1;
+                            }
+                        }
+                        continue;
+                    }
+                }
                 '(' | '[' | '{' if !in_string => {
                 self.stack.push((ch, pos, current_pos));
                 }
