@@ -5,7 +5,9 @@ use tower_lsp::lsp_types::*;
 use tree_sitter::{Parser, Tree};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use std::fmt::Debug;
 
 use crate::brace::BracketChecker;
@@ -17,21 +19,23 @@ pub struct Backend {
     /// The BracketChecker instance
     ///
     /// TODO: Give this guy a better name, merge requests are welcome
-    checker: Mutex<BracketChecker>,
+    pub checker: Arc<Mutex<BracketChecker>>,
     /// The Parser instance
-    parser: Mutex<Parser>,
+    pub parser: Arc<Mutex<Parser>>,
+    /// Last edit time
+    pub last_edit_time: Arc<Mutex<HashMap<Uri, Instant>>>,
     /// Your workspace/project folder
-    pub workspace_root: Mutex<Option<PathBuf>>,
+    pub workspace_root: Arc<Mutex<Option<PathBuf>>>,
     /// Stores parsed trees for each document
-    pub trees: Mutex<HashMap<Uri, Tree>>,
+    pub trees: Arc<Mutex<HashMap<Uri, Tree>>>,
     /// Function Definitions
-    pub fn_defs: Mutex<HashMap<Uri, HashMap<String, (Range, Option<String>)>>>,
+    pub fn_defs: Arc<Mutex<HashMap<Uri, HashMap<String, (Range, Option<String>)>>>>,
     /// Symbols
-    pub sym_defs: Mutex<HashMap<Uri, Vec<DocumentSymbol>>>,
+    pub sym_defs: Arc<Mutex<HashMap<Uri, Vec<DocumentSymbol>>>>,
     /// For storing text content of scripts
-    pub docs_content: Mutex<HashMap<Uri, String>>,
+    pub docs_content: Arc<Mutex<HashMap<Uri, String>>>,
     /// Builtin functions and methods
-    pub builtins_doc: Mutex<Builtins>,
+    pub builtins_doc: Arc<Mutex<Builtins>>,
 }
 
 impl Debug for Backend {
@@ -50,17 +54,46 @@ impl Backend {
         let mut parser = Parser::new();
         parser.set_language(&language).expect("Error loading GSC language");
 
-        Self {
+        let backend = Self {
             client,
-            checker: Mutex::new(BracketChecker::new()),
-            parser: Mutex::new(parser),
-            workspace_root: Mutex::new(None),
-            trees: Mutex::new(HashMap::new()),
-            fn_defs: Mutex::new(HashMap::new()),
-            sym_defs: Mutex::new(HashMap::new()),
-            docs_content: Mutex::new(HashMap::new()),
-            builtins_doc: Mutex::new(Builtins::new()),
-        }
+            checker: Arc::new(Mutex::new(BracketChecker::new())),
+            parser: Arc::new(Mutex::new(parser)),
+            last_edit_time: Arc::new(Mutex::new(HashMap::new())),
+            workspace_root: Arc::new(Mutex::new(None)),
+            trees: Arc::new(Mutex::new(HashMap::new())),
+            fn_defs: Arc::new(Mutex::new(HashMap::new())),
+            sym_defs: Arc::new(Mutex::new(HashMap::new())),
+            docs_content: Arc::new(Mutex::new(HashMap::new())),
+            builtins_doc: Arc::new(Mutex::new(Builtins::new())),
+        };
+/*
+        let backend_ref = Arc::new(backend);
+        let backend_clone = backend_ref.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if parse_rx.changed().await.is_err() {
+                    break;
+                }
+
+                let val = parse_rx.borrow().clone();
+                let Some((uri, text)) = val else { continue };
+
+                // Debounce: wait 300ms, if another change came in during
+                // that time, the watch channel will have a new value
+                sleep(Duration::from_millis(300)).await;
+
+                let latest = parse_rx.borrow().clone();
+                match latest {
+                    Some((latest_uri, latest_text)) if latest_uri == uri && latest_text == text => {
+                        backend_clone.parse_and_diagnose(uri, &text);
+                    }
+                    _ => continue
+                }
+            }
+        });
+*/
+        backend
     }
 }
 

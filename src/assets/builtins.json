@@ -1,6 +1,7 @@
 {
   "functions": {
     "isDefined": {
+      "camel_name": "isDefined",
       "sign": "isDefined(var)",
       "info": "Check if a variable is defined or not",
       "params": [
@@ -10,6 +11,7 @@
       "example": "if (!isDefined(myVar))\n    return;"
     },
     "spawn": {
+      "camel_name": null,
       "sign": "spawn(classname, origin)",
       "info": "Spawns an entity at the specified location",
       "params": [
@@ -22,6 +24,7 @@
   },
   "methods": {
     "iPrintLn": {
+      "camel_name": "iPrintLn",
       "sign": "iPrintLn(message)",
       "info": "Prints a message to the player's obituary",
       "called_on": "self",
@@ -32,12 +35,95 @@
       "example": "player iPrintLn(\"Hello player!\");\nlevel iPrintLn(\"Hello players!\");"
     },
     "suicide": {
+      "camel_name": null,
       "sign": "suicide()",
       "info": "Kills the player immediately as a suicide",
       "called_on": "player",
       "params": [],
       "returns": null,
       "example": "self suicide();"
+    },
+    "clonePlayer": {
+      "camel_name": "clonePlayer",
+      "sign": "clonePlayer()",
+      "info": "Clone the player's model in current state.\nUsually used for dead bodies.",
+      "called_on": "client",
+      "params": [],
+      "returns": "entity",
+      "example": "body = self clonePlayer();"
+    },
+    "giveWeapon": {
+      "camel_name": "giveWeapon",
+      "sign": "giveWeapon(weapon)",
+      "info": "Give the `weapon` to player.\nStock UO behavior is crash if player doesn't have a free slot for the weapon being given.\nThis is patched in t1x-server to take existing weapon first.",
+      "called_on": "player",
+      "params": [
+        { "name": "weapon", "type": "string", "info": "The name of weapon to give" }
+      ],
+      "returns": null,
+      "example": "self giveWeapon(\"luger_mp\");"
+    },
+    "takeWeapon": {
+      "camel_name": "takeWeapon",
+      "sign": "takeWeapon(weapon)",
+      "info": "Take the `weapon` from player.",
+      "called_on": "player",
+      "params": [
+        { "name": "weapon", "type": "string", "info": "The name of weapon to take" }
+      ],
+      "returns": null,
+      "example": "self takeWeapon(\"luger_mp\");"
+    },
+    "takeAllWeapons": {
+      "camel_name": "takeAllWeapons",
+      "sign": "takeAllWeapons()",
+      "info": "Take all weapons from player.",
+      "called_on": "player",
+      "params": [],
+      "returns": null,
+      "example": "self takeAllWeapons();"
+    },
+    "getCurrentWeapon": {
+      "camel_name": "getCurrentWeapon",
+      "sign": "getCurrentWeapon()",
+      "info": "Get player's current weapon.",
+      "called_on": "player",
+      "params": [],
+      "returns": "string",
+      "example": "weapon = self getCurrentWeapon();"
+    },
+    "hasWeapon": {
+      "camel_name": "hasWeapon",
+      "sign": "hasWeapon(weapon)",
+      "info": "Check if player has certain weapon.",
+      "called_on": "player",
+      "params": [
+        { "name": "weapon", "type": "string", "info": "The name of weapon to check for" }
+      ],
+      "returns": "bool",
+      "example": "hasColt = self hasWeapon(\"colt_mp\");"
+    },
+    "switchToWeapon": {
+      "camel_name": "switchToWeapon",
+      "sign": "switchToWeapon(weapon)",
+      "info": "Make the player switch to specified weapon.",
+      "called_on": "player",
+      "params": [
+        { "name": "weapon", "type": "string", "info": "The name of weapon to switch to" }
+      ],
+      "returns": "bool",
+      "example": "player switchToWeapon(\"ppsh_mp\");"
+    },
+    "giveStartAmmo": {
+      "camel_name": "giveStartAmmo",
+      "sign": "giveStartAmmo(weapon)",
+      "info": "Set the player's ammunition to the weapon's default starting ammunition.",
+      "called_on": "player",
+      "params": [
+        { "name": "weapon", "type": "string", "info": "The name of weapon to set ammo for" }
+      ],
+      "returns": null,
+      "example": "player giveStartAmmo(\"ppsh_mp\");"
     }
   }
 }

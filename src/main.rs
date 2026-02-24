@@ -2,6 +2,7 @@ use tower_lsp_server as tower_lsp;
 use clap::Parser;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{LanguageServer, LspService, Server, jsonrpc};
+use tokio::time::{Duration, Instant};
 use std::path::PathBuf;
 
 mod backend;
@@ -54,6 +55,11 @@ impl LanguageServer for Backend {
                 hover_provider: Some(true.into()),
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
                 definition_provider: Some(OneOf::Left(true)),
+                completion_provider: Some(CompletionOptions {
+                    resolve_provider: Some(false),
+                    trigger_characters: Some(vec![".".to_string()]),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -78,7 +84,22 @@ impl LanguageServer for Backend {
         self.client.log_message(MessageType::INFO,format!("Opened: {}", params.text_document.uri.as_str())).await;
 
         // Parse the newly opened document
-        self.parse_and_diagnose(params.text_document.uri.clone(), &params.text_document.text).await;
+        let checker = self.checker.clone();
+        let parser = self.parser.clone();
+        let trees = self.trees.clone();
+        let fn_defs = self.fn_defs.clone();
+        let sym_defs = self.sym_defs.clone();
+        let client = self.client.clone();
+        Self::parse_and_diagnose(
+            params.text_document.uri.clone(),
+            &params.text_document.text,
+            checker,
+            parser,
+            trees,
+            fn_defs,
+            sym_defs,
+            client
+        ).await;
 
         self.docs_content.lock().await.insert(params.text_document.uri, params.text_document.text);
     }
@@ -89,17 +110,39 @@ impl LanguageServer for Backend {
         if let Some(change) = params.content_changes.first() {
             self.client.log_message(MessageType::INFO, format!("Changed: {}", params.text_document.uri.as_str())).await;
 
-            // Re-parse the changed document
-            self.parse_and_diagnose(params.text_document.uri.clone(), &change.text).await;
-            let mut dc = self.docs_content.lock().await;
+            let uri = params.text_document.uri.clone();
+            let text = change.text.clone();
+            let now = Instant::now();
 
-            // https://stackoverflow.com/a/30414450
-            if dc.contains_key(&params.text_document.uri) {
-                *dc.get_mut(&params.text_document.uri).unwrap() = change.text.clone();
-            }
-            else {
-                dc.insert(params.text_document.uri, change.text.clone());
-            }
+            self.docs_content.lock().await.insert(params.text_document.uri, change.text.clone());
+            self.last_edit_time.lock().await.insert(uri.clone(), now);
+
+            let checker = self.checker.clone();
+            let parser = self.parser.clone();
+            let trees = self.trees.clone();
+            let fn_defs = self.fn_defs.clone();
+            let sym_defs = self.sym_defs.clone();
+            let client = self.client.clone();
+            let last_edit = self.last_edit_time.clone();
+
+            tokio::spawn(async move {
+                // wait 300 ms
+                tokio::time::sleep(Duration::from_millis(300)).await;
+
+                let last = last_edit.lock().await.get(&uri).copied();
+                if last == Some(now) {
+                    Self::parse_and_diagnose(
+                        uri.clone(),
+                        &text,
+                        checker,
+                        parser,
+                        trees,
+                        fn_defs,
+                        sym_defs,
+                        client
+                    ).await;
+                }
+            });
         }
     }
 
@@ -112,6 +155,7 @@ impl LanguageServer for Backend {
     {
         self.trees.lock().await.remove(&params.text_document.uri);
         self.docs_content.lock().await.remove(&params.text_document.uri);
+        self.last_edit_time.lock().await.remove(&params.text_document.uri);
         self.client.publish_diagnostics(params.text_document.uri, vec![], None).await;
         // not clearing the fn_defs for this file
     }
@@ -159,8 +203,8 @@ impl LanguageServer for Backend {
         let identifier = &src[node.start_byte()..node.end_byte()];
         if let Some(assignment_node) = self.find_var_def(identifier, node, &src) {
             let range = Range {
-                start: self.byte_to_position(&src, assignment_node.start_byte()),
-                end: self.byte_to_position(&src, assignment_node.end_byte()),
+                start: Self::byte_to_position(&src, assignment_node.start_byte()),
+                end: Self::byte_to_position(&src, assignment_node.end_byte()),
             };
             return Ok(Some(GotoDefinitionResponse::Scalar(Location {
                 uri: uri,
@@ -229,12 +273,12 @@ impl LanguageServer for Backend {
                 let b = r.methods.get(&identifier.to_ascii_lowercase());
 
                 if let Some(b) = b {
-                    self.info_from_builtin_mt(b)
+                    Self::info_from_builtin(b, &b.sign)
                 }
                 else {
                     let b = r.functions.get(&identifier.to_ascii_lowercase());
                     if let Some(b) = b {
-                        self.info_from_builtin_fn(b)
+                        Self::info_from_builtin(b, &b.sign)
                     }
                     else { String::new() }
                 }
@@ -287,6 +331,92 @@ impl LanguageServer for Backend {
         };
 
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    async fn completion(&self, params: CompletionParams) -> jsonrpc::Result<Option<CompletionResponse>>
+    {
+        let uri = params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+
+        let src = {
+            /*let trees = self.trees.lock().await;
+            let tree = match trees.get(&uri) {
+                Some(t) => t.clone(),
+                None => return Ok(None),
+            };*/
+
+            let dc = self.docs_content.lock().await;
+            let src = match dc.get(&uri) {
+                Some(s) => s.clone(),
+                None => return Ok(None),
+            };
+
+            src
+            //(tree, src)
+        };
+
+        // Check if triggered by a character
+        let trigger = params.context.and_then(|ctx| ctx.trigger_character);
+
+        eprintln!("trigger: {:?}", trigger);
+
+        if trigger == Some(".".to_string()) {
+            // TODO: completion for struct members
+            return Ok(None);
+        }
+
+        // Extract the partial word being typed from raw text
+        let prefix = self.get_word_at_position(&src, pos);
+        eprintln!("Completion prefix: '{}'", prefix);
+
+        let mut suggestions: Vec<CompletionItem> = Vec::new();
+
+        let (f, m) = {
+            let b = self.builtins_doc.lock().await;
+            (b.functions.clone(), b.methods.clone())
+        };
+
+        for (k, scr_fn) in f.iter() {
+            if k.starts_with(prefix) {
+                suggestions.push(Self::comp_item_for_builtin(&k, scr_fn));
+            }
+        }
+
+        for (k, scr_md) in m.iter() {
+            if k.starts_with(prefix) {
+                suggestions.push(Self::comp_item_for_builtin(&k, scr_md));
+            }
+        }
+
+        if let Some(local_sym_defs) = self.sym_defs.lock().await.get(&uri) {
+            for sym in local_sym_defs {
+                if sym.kind == SymbolKind::FUNCTION {
+                    if sym.name.starts_with(prefix) {
+                        suggestions.push(CompletionItem {
+                            label: sym.name.clone(),
+                            kind: Some(CompletionItemKind::FUNCTION),
+                            detail: sym.detail.clone(),
+                            ..Default::default()
+                        });
+                    }
+                }
+
+                for var in sym.children.as_ref().unwrap() {
+                    if var.kind == SymbolKind::VARIABLE {
+                        if var.name.starts_with(prefix) {
+                            suggestions.push(CompletionItem {
+                                label: var.name.clone(),
+                                kind: Some(CompletionItemKind::VARIABLE),
+                                detail: Some("Variable".to_string()),
+                                ..Default::default()
+                        });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Some(CompletionResponse::Array(suggestions)))
     }
 }
 

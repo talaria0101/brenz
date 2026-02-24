@@ -14,8 +14,20 @@ pub(crate) mod strings;
 pub(crate) mod serde_helper;
 use serde_helper::deserialize_lower_map;
 
+/// A builtin script function or method
+pub(crate) trait ScriptCallable {
+    fn kind(&self) -> String;
+    fn camel_name(&self) -> Option<String>;
+    fn sign(&self) -> String;
+    fn info(&self) -> String;
+    fn called_on(&self) -> String;
+    fn param_names(&self) -> Vec<String>;
+    fn example(&self) -> String;
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub(crate) struct ScrFunction {
+    pub camel_name: Option<String>,
     pub sign: String,
     pub info: String,
     pub params: Vec<ScrParam>,
@@ -25,12 +37,80 @@ pub(crate) struct ScrFunction {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub(crate) struct ScrMethod {
+    pub camel_name: Option<String>,
     pub sign: String,
     pub info: String,
     pub called_on: String,
     pub params: Vec<ScrParam>,
     pub returns: Option<GscType>,
     pub example: String,
+}
+
+impl ScriptCallable for ScrFunction {
+    fn kind(&self) -> String
+    {
+        "Builtin Function".to_string()
+    }
+    fn camel_name(&self) -> Option<String>
+    {
+        match &self.camel_name {
+            Some(cn) => Some(cn.clone()),
+            None => None
+        }
+    }
+    fn sign(&self) -> String
+    {
+        self.sign.clone()
+    }
+    fn info(&self) -> String
+    {
+        self.info.clone()
+    }
+    fn called_on(&self) -> String
+    {
+        "".to_string()
+    }
+    fn param_names(&self) -> Vec<String>
+    {
+        self.params.iter().map(|p| p.name.clone()).collect()
+    }
+    fn example(&self) -> String
+    {
+        self.example.clone()
+    }
+}
+impl ScriptCallable for ScrMethod {
+    fn kind(&self) -> String
+    {
+        "Builtin Method".to_string()
+    }
+    fn camel_name(&self) -> Option<String>
+    {
+        match &self.camel_name {
+            Some(cn) => Some(cn.clone()),
+            None => None
+        }
+    }
+    fn sign(&self) -> String
+    {
+        self.sign.clone()
+    }
+    fn info(&self) -> String
+    {
+        self.info.clone()
+    }
+    fn called_on(&self) -> String
+    {
+        self.called_on.clone()
+    }
+    fn param_names(&self) -> Vec<String>
+    {
+        self.params.iter().map(|p| p.name.clone()).collect()
+    }
+    fn example(&self) -> String
+    {
+        self.example.clone()
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
