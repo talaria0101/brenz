@@ -72,6 +72,7 @@ impl LanguageServer for Backend {
                 hover_provider: Some(true.into()),
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
                 definition_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(false),
                     trigger_characters: Some(vec![".".to_string()]),
@@ -410,6 +411,57 @@ impl LanguageServer for Backend {
 
         Ok(Some(CompletionResponse::Array(suggestions)))
     }
+
+    async fn code_action(
+        &self, params: CodeActionParams
+    ) -> jsonrpc::Result<Option<CodeActionResponse>>
+    {
+        let uri = params.text_document.uri.clone();
+        let (tree, src) = {
+            let trees = self.trees.lock().await;
+            let tree = match trees.get(&uri) {
+                Some(t) => t.clone(),
+                None => return Ok(None),
+            };
+            let dc = self.docs_content.lock().await;
+            let src = match dc.get(&uri) {
+                Some(s) => s.clone(),
+                None => return Ok(None),
+            };
+            (tree, src)
+        };
+
+        if let Some((range, new_text)) =
+            self.foreach_fix(&tree, &src, params.range.start)
+        {
+            let related: Vec<Diagnostic> = params
+                .context
+                .diagnostics
+                .into_iter()
+                .filter(|d| ranges_overlap(&d.range, &range))
+                .collect();
+            let mut changes = std::collections::HashMap::new();
+            changes.insert(uri, vec![TextEdit { range, new_text }]);
+            return Ok(Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
+                title: "Convert foreach to for loop".to_string(),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(related),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })]));
+        }
+
+        Ok(None)
+    }
+}
+
+fn ranges_overlap(a: &Range, b: &Range) -> bool {
+    let (a_start, a_end) = ((a.start.line, a.start.character), (a.end.line, a.end.character));
+    let (b_start, b_end) = ((b.start.line, b.start.character), (b.end.line, b.end.character));
+    a_start <= b_end && b_start <= a_end
 }
 
 #[derive(Parser)]

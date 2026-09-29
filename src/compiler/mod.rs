@@ -76,10 +76,21 @@ mod tests {
     #[test]
     fn loops_arrays_structs() {
         let out = run_src(
-            "main()\n{\n\ta = [];\n\tfor ( i = 0; i < 5; i++ )\n\t\ta[i] = i * i;\n\ttotal = 0;\n\tforeach ( v in a )\n\t\ttotal += v;\n\ts = spawnstruct();\n\ts.total = total;\n\treturn s.total;\n}\n",
+            "main()\n{\n\ta = [];\n\tfor ( i = 0; i < 5; i++ )\n\t\ta[i] = i * i;\n\ttotal = 0;\n\tfor ( j = 0; j < a.size; j++ )\n\t\ttotal += a[j];\n\ts = spawnstruct();\n\ts.total = total;\n\treturn s.total;\n}\n",
         )
         .unwrap();
         assert_eq!(out.value, value::Value::Int(30));
+    }
+
+    #[test]
+    fn foreach_is_rejected() {
+        let src = "main()\n{\n\tforeach ( v in a )\n\t\tprintln( v );\n}\n";
+        let tree = parse(src);
+        let errs = compile(&tree, src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("foreach is not supported")),
+            "{errs:?}"
+        );
     }
 
     #[test]

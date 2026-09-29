@@ -691,6 +691,13 @@ impl<'a> Compiler<'a> {
             self.fail(node, "bad foreach statement".to_string());
             return;
         };
+        // `foreach` parses (the grammar covers newer games too) but the
+        // Call of Duty 1 / United Offensive script VM has no such
+        // statement. Report it; codegen continues so nothing else is lost.
+        self.fail(
+            node,
+            "foreach is not supported in Call of Duty 1 / United Offensive GSC, use a for loop".to_string(),
+        );
         let hay_id = hay_field.id();
         let needle_id = needle.id();
         let hay = self.peel(hay_field);

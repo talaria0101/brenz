@@ -151,3 +151,85 @@ impl Backend {
         }
     }
 }
+
+impl Backend {
+    /// Quickfix for the `foreach` error: rewrite the smallest
+    /// `foreach` statement containing `pos` as a `for` loop over
+    /// `.size`, keeping the needle assignment. Returns the range to
+    /// replace and its replacement text.
+    pub(crate) fn foreach_fix(
+        &self,
+        tree: &tree_sitter::Tree,
+        src: &str,
+        pos: Position,
+    ) -> Option<(Range, String)> {
+        let mut matches = Vec::new();
+        Self::find_descendants_of_kind(tree.root_node(), "foreach_statement", &mut matches);
+        let node = matches
+            .into_iter()
+            .filter(|n| {
+                let start = Self::byte_to_position(src, n.start_byte());
+                let end = Self::byte_to_position(src, n.end_byte());
+                (start.line, start.character) <= (pos.line, pos.character)
+                    && (pos.line, pos.character) <= (end.line, end.character)
+            })
+            .min_by_key(|n| n.end_byte() - n.start_byte())?;
+
+        let needle = node.child_by_field_name("needle")?;
+        let hay = node.child_by_field_name("hay_stack")?;
+        let needle_text = src[needle.start_byte()..needle.end_byte()].to_string();
+        let hay_text = src[hay.start_byte()..hay.end_byte()].to_string();
+
+        let mut body = None;
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if !child.is_named() {
+                continue;
+            }
+            if child.id() == needle.id() || child.id() == hay.id() {
+                continue;
+            }
+            body = Some(child);
+        }
+        let mut body = body?;
+        // Strip the `statement` wrapper the grammar leaves behind.
+        while body.kind() == "statement" && body.named_child_count() == 1 {
+            body = body.named_child(0).unwrap();
+        }
+
+        let line_start = src[..node.start_byte()].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let base: String = src[line_start..node.start_byte()]
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        let inner = format!("{base}\t");
+
+        let part = if body.kind() == "block" {
+            // Verbatim inner statements between the braces.
+            let (open, close) = (body.start_byte() + 1, body.end_byte().saturating_sub(1));
+            let mut inner_text = src.get(open..close).unwrap_or("").to_string();
+            while inner_text.starts_with('\n') || inner_text.starts_with('\r') {
+                inner_text.remove(0);
+            }
+            while inner_text.ends_with('\n')
+                || inner_text.ends_with('\r')
+                || inner_text.ends_with(' ')
+                || inner_text.ends_with('\t')
+            {
+                inner_text.pop();
+            }
+            inner_text
+        } else {
+            format!("{inner}{}", src[body.start_byte()..body.end_byte()].trim_end())
+        };
+
+        let new_text = format!(
+            "{base}for ( i = 0; i < {hay_text}.size; i++ )\n{base}{{\n{inner}{needle_text} = {hay_text}[i];\n{part}\n{base}}}",
+        );
+        let range = Range {
+            start: Self::byte_to_position(src, node.start_byte()),
+            end: Self::byte_to_position(src, node.end_byte()),
+        };
+        Some((range, new_text))
+    }
+}
