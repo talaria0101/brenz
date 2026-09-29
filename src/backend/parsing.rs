@@ -1,6 +1,7 @@
 //! Parsing related methods for Backend
 
 use crate::{brace::BracketChecker, util::{LogType, logprint}};
+use crate::compiler::compile::compile as compile_gsc;
 
 use tower_lsp_server::{self as tower_lsp, Client};
 use super::Backend;
@@ -75,6 +76,12 @@ impl Backend {
                         fn_defs.lock().await.insert(uri.clone(), fns);
                         let syms = Self::extract_syms(&tree, text);
                         sym_defs.lock().await.insert(uri.clone(), syms);
+                        // Structural compile check: engine operations
+                        // still compile, so failures here are real bugs
+                        // (break outside loops, uncompilable nodes).
+                        if let Err(errors) = compile_gsc(&tree, text) {
+                            diagnostics = errors.into_iter().map(|e| e.into()).collect();
+                        }
                     }
 
                     client.publish_diagnostics(uri, diagnostics, None).await;
