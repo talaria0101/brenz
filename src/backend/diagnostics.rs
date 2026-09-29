@@ -153,6 +153,47 @@ impl Backend {
 }
 
 impl Backend {
+    /// Lowercased identifier names inside the function definition
+    /// containing `pos`, for collision-free fix generation. Compared
+    /// case-insensitively: clobbering `I` with `i` would be just as bad.
+    fn function_identifiers(&self, tree: &tree_sitter::Tree, src: &str, pos: usize) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        let mut funcs = Vec::new();
+        Self::find_descendants_of_kind(tree.root_node(), "function_definition", &mut funcs);
+        let func = funcs.into_iter().find(|n| n.start_byte() <= pos && pos <= n.end_byte());
+        let Some(func) = func else {
+            return out;
+        };
+        let mut ids = Vec::new();
+        Self::find_descendants_of_kind(func, "identifier", &mut ids);
+        for id in ids {
+            if let Ok(text) = id.utf8_text(src.as_bytes()) {
+                out.insert(text.to_lowercase());
+            }
+        }
+        out
+    }
+}
+
+/// First candidate not taken (case-insensitively), else `fallback`
+/// with a counter suffix.
+fn pick_name(taken: &std::collections::HashSet<String>, candidates: &[&str], fallback: &str) -> String {
+    for c in candidates {
+        if !taken.contains(&c.to_lowercase()) {
+            return c.to_string();
+        }
+    }
+    let mut n = 0;
+    loop {
+        n += 1;
+        let name = format!("{fallback}{n}");
+        if !taken.contains(&name) {
+            return name;
+        }
+    }
+}
+
+impl Backend {
     /// Quickfix for the `foreach` error: rewrite the smallest
     /// `foreach` statement containing `pos` as a `for` loop over
     /// `.size`, keeping the needle assignment. Returns the range to
@@ -204,6 +245,26 @@ impl Backend {
             .collect();
         let inner = format!("{base}\t");
 
+        // Fresh names that cannot collide with the enclosing function:
+        // reusing an in-scope `i` would corrupt an outer loop, and a
+        // side-effecting haystack must run once, not per iteration.
+        // Field nodes may carry an `expression` wrapper; see through it.
+        let mut hay_atom = hay;
+        while hay_atom.kind() == "expression" && hay_atom.named_child_count() == 1 {
+            hay_atom = hay_atom.named_child(0).unwrap();
+        }
+        let taken = self.function_identifiers(tree, src, node.start_byte());
+        let index_var = pick_name(&taken, &["i", "j", "k", "n", "idx"], "foreach_i");
+        let (setup, hay_expr) = if hay_atom.kind() == "identifier" {
+            (String::new(), hay_text.clone())
+        } else {
+            let hay_var = pick_name(&taken, &["hay", "array", "list"], "foreach_hay");
+            (
+                format!("{base}{hay_var} = {hay_text};\n"),
+                hay_var,
+            )
+        };
+
         let part = if body.kind() == "block" {
             // Verbatim inner statements between the braces.
             let (open, close) = (body.start_byte() + 1, body.end_byte().saturating_sub(1));
@@ -224,7 +285,7 @@ impl Backend {
         };
 
         let new_text = format!(
-            "{base}for ( i = 0; i < {hay_text}.size; i++ )\n{base}{{\n{inner}{needle_text} = {hay_text}[i];\n{part}\n{base}}}",
+            "{setup}{base}for ( {index_var} = 0; {index_var} < {hay_expr}.size; {index_var}++ )\n{base}{{\n{inner}{needle_text} = {hay_expr}[{index_var}];\n{part}\n{base}}}",
         );
         let range = Range {
             start: Self::byte_to_position(src, node.start_byte()),

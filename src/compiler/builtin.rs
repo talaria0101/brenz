@@ -6,6 +6,9 @@
 //! the VM output buffer. Any engine builtin (entities, cvars, precache,
 //! effects, objectives, ...) reports `BuiltinError::Game` naming it.
 
+// Execution lives here; the language server only runs it in tests
+// for now, so silence reachability noise until an LSP caller lands.
+#![allow(dead_code)]
 use super::value::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -45,6 +48,11 @@ fn num(n: &Value) -> Result<f32, BuiltinError> {
     match n {
         Value::Int(i) => Ok(*i as f32),
         Value::Float(f) => Ok(*f),
+        // The engine reads numbers with `CastFloat`, which takes
+        // numeric strings too.
+        Value::Str(s) => super::value::atof(s).ok_or_else(|| {
+            BuiltinError::Script(format!("expected number, got {}", n.type_name()))
+        }),
         v => Err(BuiltinError::Script(format!(
             "expected number, got {}",
             v.type_name()
@@ -63,13 +71,15 @@ fn vec(n: &Value) -> Result<[f32; 3], BuiltinError> {
 }
 
 fn expect(args: &[Value], n: usize, name: &str) -> Result<(), BuiltinError> {
-    if args.len() == n {
-        Ok(())
-    } else {
+    // The engine passes all written arguments and only reads what it
+    // needs, so extras are ignored; too few is a script error.
+    if args.len() < n {
         Err(BuiltinError::Script(format!(
-            "{name} expects {n} parameters, got {}",
+            "{name} expects at least {n} parameters, got {}",
             args.len()
         )))
+    } else {
+        Ok(())
     }
 }
 
@@ -105,27 +115,25 @@ pub(crate) fn is_engine_method(name: &str) -> bool {
         .contains(name)
 }
 
-/// Certain parameter counts, `(min, max)`, from the C implementations.
-/// Only what the engine provably enforces: strict `!=` checks, `<`
-/// minimums, and the pure builtins above. Variadics (`print`, ...) and
-/// anything optional-heavy report `None` and are never flagged.
-pub(crate) fn arity(name: &str) -> Option<(usize, Option<usize>)> {
-    let exact = |n: usize| Some((n, Some(n)));
+/// Minimum parameter counts from the C implementations. Only what
+/// the engine provably enforces: strict `!=` checks (which fail below
+/// the count), `<` minimums, and the pure builtins above. The engine
+/// ignores extra arguments, so maximums are never flagged. Variadics
+/// (`print`, ...) and anything optional-heavy report `None`.
+pub(crate) fn arity(name: &str) -> Option<usize> {
     match name {
         "isdefined" | "assert" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "length"
         | "lengthsquared" | "vectornormalize" | "vectortoangles" | "anglestoforward"
-        | "anglestoright" | "anglestoup" | "randomint" | "randomfloat" => exact(1),
+        | "anglestoright" | "anglestoup" | "randomint" | "randomfloat" => Some(1),
         "distance" | "distancesquared" | "vectordot" | "randomintrange" | "randomfloatrange" => {
-            exact(2)
+            Some(2)
         }
-        "closer" => exact(3),
-        "spawnstruct" => exact(0),
-        "playfxontag" => exact(3),
-        "rewindfx" => exact(2),
-        "setcullfog" => exact(6),
-        "setexpfog" => exact(5),
-        "dodamage" => Some((2, None)),
-        "dodamagemod" => Some((3, None)),
+        "closer" | "playfxontag" => Some(3),
+        "rewindfx" => Some(2),
+        "setcullfog" => Some(6),
+        "setexpfog" => Some(5),
+        "dodamagemod" => Some(3),
+        "dodamage" => Some(2),
         _ => None,
     }
 }
@@ -259,10 +267,11 @@ pub(crate) fn call(
         }
         "closer" => {
             expect(args, 3, name)?;
-            let (a, b) = (vec(&args[0])?, vec(&args[1])?);
-            let d = num(&args[2])?;
-            let dist2 = (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2);
-            Ok(Value::Int(i32::from(dist2 <= d * d)))
+            let (origin, a, b) = (vec(&args[0])?, vec(&args[1])?, vec(&args[2])?);
+            let dist = |p: [f32; 3]| {
+                (p[0] - origin[0]).powi(2) + (p[1] - origin[1]).powi(2) + (p[2] - origin[2]).powi(2)
+            };
+            Ok(Value::Int(i32::from(dist(a) < dist(b))))
         }
         "randomint" => {
             expect(args, 1, name)?;
@@ -316,6 +325,11 @@ mod tests {
             panic!()
         };
         assert!(c.abs() < 1e-6);
+        // Numeric strings coerce like the engine's `CastFloat`.
+        assert_eq!(
+            run("sin", vec![Value::Str("90".into())]).unwrap(),
+            Value::Float(1.0)
+        );
     }
 
     #[test]
@@ -334,6 +348,17 @@ mod tests {
             run("getent", vec![Value::Str("x".into())]),
             Err(BuiltinError::Game("getent needs a game attached".to_string()))
         );
+    }
+
+    #[test]
+    fn closer_compares_to_reference() {
+        let o = Value::Vec3([0.0, 0.0, 0.0]);
+        let a = Value::Vec3([1.0, 0.0, 0.0]);
+        let b = Value::Vec3([5.0, 0.0, 0.0]);
+        assert_eq!(run("closer", vec![o.clone(), a, b]).unwrap(), Value::Int(1));
+        let a = Value::Vec3([9.0, 0.0, 0.0]);
+        let b = Value::Vec3([5.0, 0.0, 0.0]);
+        assert_eq!(run("closer", vec![o, a, b]).unwrap(), Value::Int(0));
     }
 
     #[test]

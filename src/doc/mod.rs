@@ -170,9 +170,9 @@ impl Backend {
         if !docs_dir.exists() {
             fs::create_dir_all(&docs_dir).unwrap();
         }
-        if !fns_file.exists() {
-            fs::write(fns_file, BUILTINS).expect("Couldn't write builtin functions to file");
-        }
+        // Always refresh: the file is unpacked from the binary, so a
+        // stale copy from an older Brenz would otherwise linger.
+        fs::write(&fns_file, BUILTINS).expect("Couldn't write builtin functions to file");
         // Drop the artifacts of the old JSON format, if present.
         let _ = fs::remove_file(docs_dir.join("builtins.json"));
         let _ = fs::remove_file(docs_dir.join("brenz-builtins-schema.json"));
@@ -184,10 +184,11 @@ impl Backend {
         let docs_dir = data_dir.join("docs");
         let fns_file = docs_dir.join("builtins.ron");
 
-        let content = tokio::fs::read_to_string(fns_file).await
-            .expect("Couldn't read builtin functions file");
-        let builtins: Builtins = ron::from_str(&content)
-            .expect("Couldn't parse builtin functions file");
+        let content = tokio::fs::read_to_string(&fns_file).await.unwrap_or_else(|_| BUILTINS.to_string());
+        let builtins: Builtins = ron::from_str(&content).unwrap_or_else(|e| {
+            util::logprint!(util::LogType::Error, "Couldn't parse builtin functions file, using embedded docs: {e}");
+            ron::from_str(BUILTINS).expect("embedded builtins.ron")
+        });
 
         *self.builtins_doc.lock().await = builtins;
     }

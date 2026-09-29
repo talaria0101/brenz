@@ -7,6 +7,9 @@
 //! limit (configurable) stops infinite loops, which have no game
 //! scheduler to preempt them here.
 
+// Execution lives here; the language server only runs it in tests
+// for now, so silence reachability noise until an LSP caller lands.
+#![allow(dead_code)]
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -446,16 +449,20 @@ impl<'a> Vm<'a> {
                 }
                 Op::Inc | Op::Dec => {
                     let v = self.pop(pos)?;
-                    let out = match v {
-                        Value::Int(i) => {
-                            Value::Int(if matches!(instr.op, Op::Inc) { i.wrapping_add(1) } else { i.wrapping_sub(1) })
-                        }
-                        Value::Float(f) => {
-                            Value::Float(if matches!(instr.op, Op::Inc) { f + 1.0 } else { f - 1.0 })
-                        }
-                        v => return Err(fail(format!("cannot increment {}", v.type_name()))),
+                    // The engine applies `++`/`--` to ints only.
+                    let Value::Int(i) = v else {
+                        let what = if matches!(instr.op, Op::Inc) { "++" } else { "--" };
+                        return Err(fail(format!(
+                            "{what} must be applied to an int (applied to {})",
+                            v.type_name()
+                        )));
                     };
-                    self.stack.push(out);
+                    let out = if matches!(instr.op, Op::Inc) {
+                        i.wrapping_add(1)
+                    } else {
+                        i.wrapping_sub(1)
+                    };
+                    self.stack.push(Value::Int(out));
                 }
                 Op::BitOr | Op::BitXor | Op::BitAnd => {
                     let b = self.pop(pos)?;

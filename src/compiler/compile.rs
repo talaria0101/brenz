@@ -266,12 +266,24 @@ impl<'a> Compiler<'a> {
             }
             defs.push((name, params, child));
         }
-        for (name, params, _) in &defs {
-            self.functions.entry(name.clone()).or_insert(FuncInfo {
-                entry: usize::MAX,
-                params: params.clone(),
-                slots: 0,
-            });
+        for (name, params, node) in &defs {
+            if self.functions.contains_key(name) {
+                // The engine rejects redefinition. Last body wins so
+                // later code still resolves, but it is reported.
+                if let Some(head) = node.child_by_field_name("func_head") {
+                    if let Some(name_node) = head.named_child(0) {
+                        self.fail(&name_node, format!("function '{name}' already defined"));
+                    }
+                }
+            }
+            self.functions.insert(
+                name.clone(),
+                FuncInfo {
+                    entry: usize::MAX,
+                    params: params.clone(),
+                    slots: 0,
+                },
+            );
         }
         for (name, _, node) in &defs {
             self.compile_function(name, node);
@@ -772,7 +784,17 @@ impl<'a> Compiler<'a> {
             .children_by_field_name("switch_block", &mut cursor)
             .filter(|c| c.is_named())
             .collect();
-        let mut next_jumps: Vec<usize> = Vec::new();
+        // Bodies run in order with C-like fallthrough. Tests come
+        // first, each jumping to its body on match; bodies are laid
+        // out after the tests in order so they chain into each other.
+        // `break` still leaves the switch.
+        struct Clause<'x> {
+            is_default: bool,
+            val: Option<Node<'x>>,
+            body: Vec<Node<'x>>,
+            node: Node<'x>,
+        }
+        let mut collected: Vec<Clause<'a>> = Vec::new();
         for child in clauses {
             match child.kind() {
                 "case_statement" => {
@@ -781,38 +803,87 @@ impl<'a> Compiler<'a> {
                         continue;
                     };
                     let val_id = val_field.id();
-                    for p in next_jumps.drain(..) {
-                        self.patch(p);
-                    }
-                    self.emit(Op::GetLocal, Operand::Slot(subj), &child);
-                    let val = self.peel(val_field);
-                    self.compile_expr(&val);
-                    self.emit_simple(Op::Equal, &child);
-                    next_jumps.push(self.emit_jump(Op::JumpOnFalse, &child));
+                    let mut body = Vec::new();
                     for stmt in self.named_children(&child) {
                         if stmt.id() == val_id {
                             continue;
                         }
-                        let s = self.peel(stmt);
-                        self.compile_stmt(&s);
+                        body.push(self.peel(stmt));
                     }
+                    collected.push(Clause {
+                        is_default: false,
+                        val: Some(self.peel(val_field)),
+                        body,
+                        node: child,
+                    });
                 }
                 "default_statement" => {
-                    for p in next_jumps.drain(..) {
-                        self.patch(p);
-                    }
+                    let mut body = Vec::new();
                     for stmt in self.named_children(&child) {
-                        let s = self.peel(stmt);
-                        self.compile_stmt(&s);
+                        body.push(self.peel(stmt));
                     }
+                    collected.push(Clause {
+                        is_default: true,
+                        val: None,
+                        body,
+                        node: child,
+                    });
                 }
                 _ => {}
             }
         }
-        for p in next_jumps.drain(..) {
-            self.patch(p);
+        // The engine rejects duplicate case values; check the ones
+        // known statically, and skip the rest.
+        let mut seen_cases: Vec<Value> = Vec::new();
+        for clause in &collected {
+            if clause.is_default {
+                continue;
+            }
+            if let Some(v) = clause.val.as_ref().and_then(|n| self.static_value(n)) {
+                if seen_cases.iter().any(|s| Value::equals(s, &v).unwrap_or(false)) {
+                    self.fail(
+                        clause.val.as_ref().unwrap(),
+                        "duplicate case expression".to_string(),
+                    );
+                } else {
+                    seen_cases.push(v);
+                }
+            }
+        }
+        // Tests first.
+        let mut to_body: Vec<(usize, usize)> = Vec::new();
+        let mut pending_jof: Option<usize> = None;
+        for (i, clause) in collected.iter().enumerate() {
+            if let Some(jof) = pending_jof.take() {
+                self.patch(jof);
+            }
+            if clause.is_default {
+                to_body.push((self.emit_jump(Op::Jump, &clause.node), i));
+            } else {
+                self.emit(Op::GetLocal, Operand::Slot(subj), &clause.node);
+                self.compile_expr(clause.val.as_ref().unwrap());
+                self.emit_simple(Op::Equal, &clause.node);
+                pending_jof = Some(self.emit_jump(Op::JumpOnFalse, &clause.node));
+                to_body.push((self.emit_jump(Op::Jump, &clause.node), i));
+            }
+        }
+        // Then bodies in order; fallthrough is adjacency.
+        for (i, clause) in collected.iter().enumerate() {
+            let at = self.code.len();
+            for (jump_idx, ci) in to_body.iter() {
+                if *ci == i {
+                    self.patch_to(*jump_idx, at);
+                }
+            }
+            for stmt in &clause.body {
+                self.compile_stmt(stmt);
+            }
         }
         let end = self.code.len();
+        if let Some(jof) = pending_jof {
+            // No clause matched and no default took it: leave.
+            self.patch_to(jof, end);
+        }
         let ctx = self.cur.as_mut().expect("no function").loops.pop().unwrap();
         for p in ctx.break_patches {
             self.patch_to(p, end);
@@ -1350,8 +1421,7 @@ impl<'a> Compiler<'a> {
             "+" | "-" | "*" | "/" | "%" => {
                 Value::arith(op.chars().next().unwrap(), &lv, &rv).err()
             }
-            "<<" | ">>" | "|" | "^" | "&" => Self::check_int_only(&lv, &rv)
-                .map(|kind| format!("{kind} needs integer operands")),
+            "<<" | ">>" | "|" | "^" | "&" => Self::check_int_only(&lv, &rv),
             _ => None,
         };
         if let Some(message) = err {
@@ -1359,19 +1429,17 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Shifts and bitwise ops need integers; floats may coerce at
-    /// runtime, so only certainly-wrong kinds are flagged.
-    fn check_int_only(lv: &Value, rv: &Value) -> Option<&'static str> {
-        fn bad(v: &Value) -> bool {
-            matches!(
-                v,
-                Value::Str(_) | Value::Vec3(_) | Value::Array(_) | Value::Entity | Value::Undefined
-            )
-        }
-        if bad(lv) || bad(rv) {
-            Some("operator")
-        } else {
-            None
+    /// Shifts and bitwise ops coerce the pair, then require integers,
+    /// like the engine. Anything else is certainly wrong.
+    fn check_int_only(lv: &Value, rv: &Value) -> Option<String> {
+        match Value::coerce_pair(lv.clone(), rv.clone()) {
+            Ok((Value::Int(_), Value::Int(_))) => None,
+            Ok((l, r)) => Some(format!(
+                "operator needs integer operands, got {} and {}",
+                l.type_name(),
+                r.type_name()
+            )),
+            Err(message) => Some(message),
         }
     }
 
@@ -1536,6 +1604,7 @@ impl<'a> Compiler<'a> {
                 let Some((base, idx)) = self.compile_addr(&var) else {
                     return;
                 };
+                self.push_addr(&base, &idx, node);
                 self.emit_simple(Op::GetIndex, node);
                 self.compile_expr(&val);
                 self.emit_simple(arith, node);
@@ -1599,6 +1668,8 @@ impl<'a> Compiler<'a> {
                 // The store consumes address and value; park the value
                 // in a temp so the assignment still yields it.
                 let t_v = self.temp_slot();
+                self.emit(Op::SetLocal, Operand::Slot(t_v), node);
+                self.emit(Op::GetLocal, Operand::Slot(t_v), node);
                 self.emit_simple(Op::SetIndex, node);
                 self.emit(Op::GetLocal, Operand::Slot(t_v), node);
             }
@@ -1679,6 +1750,13 @@ fn is_game_object(name: &str) -> bool {
     matches!(name, "self" | "level" | "game" | "anim")
 }
 
+/// The grammar's optional `thread` prefix is an anonymous token:
+/// scan all children, not just the named ones.
+fn has_thread_prefix(node: &Node) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|c| c.kind() == "thread")
+}
+
 impl<'a> Compiler<'a> {
     fn compile_call_args(&mut self, node: &Node<'a>) -> usize {
         for child in self.named_children(node) {
@@ -1708,11 +1786,14 @@ impl<'a> Compiler<'a> {
             }
         }
         if foreign || callee.is_none() {
-            self.emit(
-                Op::NeedGame,
-                Operand::Name("foreign calls need a linked script".to_string()),
-                node,
-            );
+            // `thread [[f]]()` arrives here: no identifier callee, but
+            // the reason is the scheduler, not linkage.
+            let message = if threaded {
+                "thread needs a game scheduler".to_string()
+            } else {
+                "foreign calls need a linked script".to_string()
+            };
+            self.emit(Op::NeedGame, Operand::Name(message), node);
             self.emit_simple(Op::GetUndefined, node);
             return;
         }
@@ -1733,18 +1814,13 @@ impl<'a> Compiler<'a> {
         } else {
             // Builtin (pure or engine), or a function from another file:
             // resolved at runtime so the file still compiles standalone.
-            // Arity is checked only when the engine provably enforces it.
-            if let Some((min, max)) = builtin::arity(&name) {
-                let bad = argc < min || max.is_some_and(|m| argc > m);
-                if bad {
-                    let expected = match max {
-                        Some(m) if m == min => format!("{min} parameters"),
-                        Some(m) => format!("{min} to {m} parameters"),
-                        None => format!("at least {min} parameters"),
-                    };
+            // Arity is checked only when the engine provably enforces a
+            // minimum; extra arguments are ignored by the engine.
+            if let Some(min) = builtin::arity(&name) {
+                if argc < min {
                     self.fail(
                         &callee,
-                        format!("{name} expects {expected}, got {argc}"),
+                        format!("{name} expects at least {min} parameters, got {argc}"),
                     );
                 }
             }
@@ -1779,25 +1855,42 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_object_call(&mut self, node: &Node<'a>) {
-        let mut obj = None;
+        // The grammar orders children as object, optional `thread`,
+        // then the method reference: take them positionally so array
+        // and member objects (`a[0] foo()`) work too.
+        let mut kids = self.named_children(node);
+        if kids.is_empty() {
+            self.fail(node, "bad method call".to_string());
+            return;
+        }
+        let obj = self.peel(kids.remove(0));
         let mut method = None;
-        for child in self.named_children(node) {
+        for child in &kids {
             match child.kind() {
-                "identifier" => {
-                    if obj.is_none() {
-                        obj = Some(child);
-                    } else if method.is_none() {
-                        method = Some(child);
-                    }
+                "local_function_ptr" | "foreign_function_ptr" => {
+                    method = Some(*child);
+                    break;
                 }
-                "local_function_ptr" | "foreign_function_ptr" => method = Some(child),
+                "identifier" => {
+                    method = Some(*child);
+                    break;
+                }
                 _ => {}
             }
         }
-        let (Some(obj), Some(method)) = (obj, method) else {
+        let Some(method) = method else {
             self.fail(node, "bad method call".to_string());
             return;
         };
+        if has_thread_prefix(node) {
+            self.emit(
+                Op::NeedGame,
+                Operand::Name("thread needs a game scheduler".to_string()),
+                node,
+            );
+            self.emit_simple(Op::GetUndefined, node);
+            return;
+        }
         let obj_name = self.text(&obj).to_string();
         if is_game_object(&obj_name) {
             self.emit(
@@ -1857,6 +1950,15 @@ impl<'a> Compiler<'a> {
             self.fail(node, "bad pointer call".to_string());
             return;
         };
+        if has_thread_prefix(node) {
+            self.emit(
+                Op::NeedGame,
+                Operand::Name("thread needs a game scheduler".to_string()),
+                node,
+            );
+            self.emit_simple(Op::GetUndefined, node);
+            return;
+        }
         // [[expr]]: stash the reference in a temp first, so it sits
         // below the arguments for CallPointer to pop last.
         let t = self.temp_slot();

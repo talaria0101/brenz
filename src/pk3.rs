@@ -65,11 +65,20 @@ pub(crate) struct Pk3Index {
 
 impl Pk3Index {
     /// Normalize an archive member name (or a lookup candidate) so that
-    /// lookups are case-insensitive and separator-insensitive.
+    /// lookups are case-insensitive and separator-insensitive. Repeated
+    /// separators and leading `./` segments collapse away.
     pub(crate) fn normalize(name: &str) -> String {
-        let n = name.replace('\\', "/");
-        let n = n.strip_prefix("./").unwrap_or(&n);
-        let n = n.strip_prefix('/').unwrap_or(n);
+        let mut n = name.replace('\\', "/");
+        loop {
+            let next = n.replace("//", "/");
+            if next.len() == n.len() {
+                break;
+            }
+            n = next;
+        }
+        while let Some(stripped) = n.strip_prefix("./").or_else(|| n.strip_prefix('/')) {
+            n = stripped.to_string();
+        }
         n.to_lowercase()
     }
 
@@ -103,7 +112,7 @@ impl Pk3Index {
                 return best_first(hits.clone());
             }
         }
-        let suffix = format!("/{}.gsc", script.to_lowercase());
+        let suffix = format!("/{}", Self::normalize(&format!("{script}.gsc")));
         let mut keys: Vec<&String> = self
             .entries
             .keys()
@@ -131,10 +140,23 @@ impl Pk3Index {
     /// Build the index for `game_paths`, reusing the on-disk cache in
     /// `<workspace_root>/.cache/brenz/` where the archives are unchanged.
     /// With no workspace root the index is built in memory only.
+    /// Relative game paths resolve against the workspace root, so the
+    /// server's working directory never matters.
     pub(crate) fn load_or_build(
         workspace_root: Option<&PathBuf>,
         game_paths: &[PathBuf],
     ) -> Self {
+        let game_paths: Vec<PathBuf> = game_paths
+            .iter()
+            .map(|p| {
+                if p.is_absolute() {
+                    p.clone()
+                } else {
+                    workspace_root.map(|r| r.join(p)).unwrap_or_else(|| p.clone())
+                }
+            })
+            .collect();
+        let game_paths = &game_paths;
         let archives = list_pk3_archives(game_paths);
         if archives.is_empty() {
             return Self::default();
@@ -278,13 +300,28 @@ fn archive_fingerprint(pk3: &Path) -> Option<ArchiveFingerprint> {
 }
 
 /// Position of an archive's directory in `game_paths`. Unknown
-/// directories sort last rather than failing the lookup.
+/// directories sort last rather than failing the lookup. Comparison
+/// canonicalizes both sides so trailing slashes, `.` segments and
+/// symlinks do not break the match.
 fn dir_order_of(game_paths: &[PathBuf], archive: &Path) -> usize {
     let parent = archive.parent();
     game_paths
         .iter()
-        .position(|d| Some(d.as_path()) == parent)
+        .position(|d| same_dir(d, parent))
         .unwrap_or(usize::MAX)
+}
+
+fn same_dir(dir: &Path, parent: Option<&Path>) -> bool {
+    let Some(parent) = parent else {
+        return false;
+    };
+    if dir == parent {
+        return true;
+    }
+    match (std::fs::canonicalize(dir), std::fs::canonicalize(parent)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// `.pk3` files (case-insensitive extension) directly inside `game_paths`,
@@ -332,7 +369,7 @@ fn scan_archive(pk3: &Path) -> io::Result<Vec<(String, String)>> {
             continue;
         }
         let inner = f.name().to_string();
-        if inner.ends_with(".gsc") || inner.ends_with(".GSC") {
+        if inner.to_lowercase().ends_with(".gsc") {
             out.push((Pk3Index::normalize(&inner), inner));
         }
     }
@@ -457,6 +494,16 @@ mod tests {
         );
         assert_eq!(Pk3Index::normalize("/maps/dm.gsc"), "maps/dm.gsc");
         assert_eq!(Pk3Index::normalize("./maps/dm.gsc"), "maps/dm.gsc");
+        assert_eq!(Pk3Index::normalize("././maps//dm.gsc"), "maps/dm.gsc");
+    }
+
+    #[test]
+    fn mixed_case_extension_is_indexed() {
+        let dir = fresh_temp_dir("pk3mixedext");
+        make_pk3(&dir, "pak0.pk3", &[("maps/mp/dm.Gsc", "main() {}\n")]);
+        let index = Pk3Index::load_or_build(None, &[dir]);
+        assert_eq!(index.entry_count(), 1);
+        assert_eq!(index.lookup(Some("maps/mp/"), "dm").len(), 1);
     }
 
     #[test]

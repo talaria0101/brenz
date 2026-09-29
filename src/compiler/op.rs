@@ -5,6 +5,9 @@
 //! (entities, threads, notifications) compile to `NeedGame`, which raises
 //! a clear runtime error only if executed.
 
+// Execution lives here; the language server only runs it in tests
+// for now, so silence reachability noise until an LSP caller lands.
+#![allow(dead_code)]
 /// An instruction. Jumps carry absolute code offsets, patched by the
 /// compiler after the target is emitted.
 #[derive(Debug, Clone)]

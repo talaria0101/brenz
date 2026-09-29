@@ -17,7 +17,7 @@ use std::fmt;
 use std::rc::Rc;
 
 /// A runtime script value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) enum Value {
     Undefined,
     Int(i32),
@@ -36,6 +36,26 @@ pub(crate) enum Value {
     /// stand-in for declared builtin signatures, never constructed
     /// by the VM itself.
     Entity,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Undefined, Value::Undefined) => true,
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::IStr(a), Value::IStr(b)) => a == b,
+            (Value::Vec3(a), Value::Vec3(b)) => a == b,
+            // Handles, like the engine: identity, never a content walk
+            // (which would diverge on self-referential values).
+            (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
+            (Value::Struct(a), Value::Struct(b)) => Rc::ptr_eq(a, b),
+            (Value::Func(a), Value::Func(b)) => a == b,
+            (Value::Entity, Value::Entity) => true,
+            _ => false,
+        }
+    }
 }
 
 impl Value {
@@ -89,7 +109,8 @@ impl Value {
             (Value::Str(x), Value::Str(y)) => x == y,
             (Value::IStr(x), Value::IStr(y)) => x == y,
             (Value::Vec3(x), Value::Vec3(y)) => x == y,
-            (Value::Array(x), Value::Array(y)) => x == y,
+            (Value::Array(x), Value::Array(y)) => Rc::ptr_eq(x, y),
+            (Value::Struct(x), Value::Struct(y)) => Rc::ptr_eq(x, y),
             (Value::Entity, Value::Entity) => true,
             _ => false,
         })
@@ -102,7 +123,7 @@ impl Value {
             Value::Int(i) => Ok(*i != 0),
             Value::Float(f) => Ok(*f != 0.0),
             Value::Str(s) => {
-                let n: i32 = s.trim().parse().unwrap_or(0);
+                let n = atoi(s);
                 if n == 0 && !is_zero_literal(s) {
                     return Err(format!("cannot cast \"{s}\" to bool"));
                 }
@@ -118,7 +139,7 @@ impl Value {
             Value::Int(i) => Ok(*i),
             Value::Float(f) => Ok(*f as i32),
             Value::Str(s) => {
-                let n: i32 = s.trim().parse().unwrap_or(0);
+                let n = atoi(s);
                 if n == 0 && !is_zero_literal(s) {
                     return Err(format!("cannot cast \"{s}\" to int"));
                 }
@@ -133,10 +154,7 @@ impl Value {
         match self {
             Value::Float(f) => Ok(*f),
             Value::Int(i) => Ok(*i as f32),
-            Value::Str(s) => s
-                .trim()
-                .parse()
-                .map_err(|_| format!("cannot cast \"{s}\" to float")),
+            Value::Str(s) => atof(s).ok_or_else(|| format!("cannot cast \"{s}\" to float")),
             v => Err(format!("cannot cast {} to float", v.type_name())),
         }
     }
@@ -195,7 +213,10 @@ impl Value {
                     '-' => x - y,
                     '*' => x * y,
                     '/' => {
-                        if y == 0.0 && y == y {
+                        // NaN is the only float unequal to itself; it
+                        // passes through like the engine, only a true
+                        // zero divisor errors.
+                        if y == 0.0 && !y.is_nan() {
                             return Err("divide by 0".to_string());
                         }
                         x / y
@@ -267,6 +288,17 @@ impl Value {
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_depth(f, 0)
+    }
+}
+
+impl Value {
+    /// Depth-capped display: self-referential values (`a[0] = a`)
+    /// would otherwise recurse until the process aborts.
+    fn fmt_depth(&self, f: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
+        if depth > 8 {
+            return write!(f, "...");
+        }
         match self {
             Value::Undefined => write!(f, "undefined"),
             Value::Int(i) => write!(f, "{i}"),
@@ -279,7 +311,7 @@ impl fmt::Display for Value {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{item}")?;
+                    item.fmt_depth(f, depth + 1)?;
                 }
                 write!(f, "]")
             }
@@ -292,7 +324,8 @@ impl fmt::Display for Value {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{k}: {}", fields[*k])?;
+                    write!(f, "{k}: ")?;
+                    fields[*k].fmt_depth(f, depth + 1)?;
                 }
                 write!(f, "}}")
             }
@@ -316,6 +349,39 @@ fn fmt_float(f: f32) -> String {
 
 fn fmt_vec(v: &[f32; 3]) -> String {
     format!("({}, {}, {})", fmt_float(v[0]), fmt_float(v[1]), fmt_float(v[2]))
+}
+
+/// `atoi` semantics: optional sign, leading digits, else 0.
+fn atoi(text: &str) -> i32 {
+    let t = text.trim();
+    let (t, neg) = match t.strip_prefix(['+', '-']) {
+        Some(rest) => (rest, t.starts_with('-')),
+        None => (t, false),
+    };
+    let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let n: i32 = digits.parse().unwrap_or(0);
+    if neg { n.wrapping_neg() } else { n }
+}
+
+/// `atof` semantics: leading numeric text parses, else fails.
+pub(crate) fn atof(text: &str) -> Option<f32> {
+    let mut t = text.trim();
+    t = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let mut len = 0;
+    let bytes = t.as_bytes();
+    while len < bytes.len() && bytes[len].is_ascii_digit() {
+        len += 1;
+    }
+    if len < bytes.len() && bytes[len] == b'.' {
+        len += 1;
+        while len < bytes.len() && bytes[len].is_ascii_digit() {
+            len += 1;
+        }
+    }
+    if len == 0 {
+        return None;
+    }
+    t[..len].parse::<f32>().ok()
 }
 
 /// Mirrors the engine's zero-literal check: `atoi` yielding 0 is only a
@@ -363,6 +429,25 @@ mod tests {
         assert!(Value::Str("abc".into()).truthy().is_err());
         assert!(Value::Undefined.truthy().is_err());
         assert!(Value::Vec3([1.0, 0.0, 0.0]).truthy().is_err());
+    }
+
+    #[test]
+    fn atoi_atof_leniency() {
+        assert!(Value::Str("12abc".into()).truthy().unwrap());
+        assert_eq!(Value::Str("12abc".into()).cast_int().unwrap(), 12);
+        assert_eq!(Value::Str("5.5x".into()).cast_float().unwrap(), 5.5);
+        assert!(Value::Str("abc".into()).cast_float().is_err());
+    }
+
+    #[test]
+    fn cyclic_values_terminate() {
+        let arr = Value::Array(Rc::new(RefCell::new(Vec::new())));
+        if let Value::Array(items) = &arr {
+            items.borrow_mut().push(arr.clone());
+        }
+        let s = format!("{arr}");
+        assert!(s.contains("..."), "{s}");
+        assert!(Value::equals(&arr, &arr).unwrap());
     }
 
     #[test]

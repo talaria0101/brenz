@@ -104,14 +104,18 @@ impl Backend {
         &self, uri: &Uri, name: String, comment: bool
     ) -> Option<(Range, Option<String>)>
     {
+        // The engine interns names lowercased, so `Foo` and `foo` are
+        // the same function. Prefer the exact spelling, then fall back
+        // to a case-insensitive scan.
         let fn_defs = self.fn_defs.lock().await;
-        let func = fn_defs.get(&uri)?;
-        let rng = func.get(&name)?.0;
-        let cmt = if comment {
-            func.get(&name)?.1.clone()
-        } else { None };
+        let func = fn_defs.get(uri)?;
+        let hit = func.get(&name).or_else(|| {
+            let lower = name.to_lowercase();
+            func.iter().find(|(k, _)| k.to_lowercase() == lower).map(|(_, v)| v)
+        })?;
+        let cmt = if comment { hit.1.clone() } else { None };
 
-        Some((rng, cmt))
+        Some((hit.0, cmt))
     }
 
     pub(crate) fn info_from_builtin<T: ScriptCallable>(builtin: &T, sign: &str) -> String

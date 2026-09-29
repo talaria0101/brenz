@@ -83,6 +83,22 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_function_is_reported() {
+        let src = "f()\n{\n\treturn 1;\n}\nf()\n{\n\treturn 2;\n}\nmain()\n{\n\treturn f();\n}\n";
+        let tree = parse(src);
+        let errs = compile(&tree, src).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("already defined")), "{errs:?}");
+    }
+
+    #[test]
+    fn duplicate_case_is_reported() {
+        let src = "main()\n{\n\tswitch ( x )\n\t{\n\t\tcase 1:\n\t\t\treturn 1;\n\t\tcase 1:\n\t\t\treturn 2;\n\t}\n}\n";
+        let tree = parse(src);
+        let errs = compile(&tree, src).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("duplicate case")), "{errs:?}");
+    }
+
+    #[test]
     fn foreach_is_rejected() {
         let src = "main()\n{\n\tforeach ( v in a )\n\t\tprintln( v );\n}\n";
         let tree = parse(src);
@@ -94,12 +110,43 @@ mod tests {
     }
 
     #[test]
+    fn switch_fallthrough() {
+        let out = run_src(
+            "main()\n{\n\tx = 1;\n\ty = 0;\n\tswitch ( x )\n\t{\n\t\tcase 1:\n\t\t\ty = 10;\n\t\tcase 2:\n\t\t\ty += 100;\n\t\t\tbreak;\n\t\tdefault:\n\t\t\ty = -1;\n\t}\n\treturn y;\n}\n",
+        )
+        .unwrap();
+        assert_eq!(out.value, value::Value::Int(110));
+    }
+
+    #[test]
     fn switch_and_strings() {
         let out = run_src(
             "grade( x )\n{\n\tswitch ( x )\n\t{\n\t\tcase 1:\n\t\t\treturn \"one\";\n\t\tcase 2:\n\t\t\treturn \"two\";\n\t\tdefault:\n\t\t\treturn \"many\" + \"!\";\n\t}\n}\nmain()\n{\n\treturn grade( 7 );\n}\n",
         )
         .unwrap();
         assert_eq!(out.value, value::Value::Str("many!".into()));
+    }
+
+    #[test]
+    fn array_assign_forms() {
+        // Chained plain assignment yields the value.
+        let out = run_src(
+            "main()\n{\n\ta = [];\n\tb = [];\n\ta[0] = b[1] = 7;\n\treturn a[0] + b[1];\n}\n",
+        )
+        .unwrap();
+        assert_eq!(out.value, value::Value::Int(14));
+        // Compound assignment on elements.
+        let out = run_src(
+            "main()\n{\n\ta = [];\n\ta[0] = 3;\n\ta[0] += 4;\n\ta[0] *= 2;\n\treturn a[0];\n}\n",
+        )
+        .unwrap();
+        assert_eq!(out.value, value::Value::Int(14));
+        // Postfix on elements yields the old value.
+        let out = run_src(
+            "main()\n{\n\ta = [];\n\ta[0] = 3;\n\tx = a[0]++;\n\treturn x + a[0];\n}\n",
+        )
+        .unwrap();
+        assert_eq!(out.value, value::Value::Int(7));
     }
 
     #[test]
@@ -113,11 +160,14 @@ mod tests {
 
     #[test]
     fn builtin_arity() {
-        let tree = parse("main()\n{\n\tx = sin( 1, 2 );\n}\n");
-        let errs = compile(&tree, "main()\n{\n\tx = sin( 1, 2 );\n}\n").unwrap_err();
-        assert!(errs.iter().any(|e| e.message.contains("expects 1 parameters, got 2")), "{errs:?}");
+        let tree = parse("main()\n{\n\tx = sin();\n}\n");
+        let errs = compile(&tree, "main()\n{\n\tx = sin();\n}\n").unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("expects at least 1 parameters, got 0")), "{errs:?}");
         let tree = parse("main()\n{\n\tx = sin( 30 );\n}\n");
         assert!(compile(&tree, "main()\n{\n\tx = sin( 30 );\n}\n").is_ok());
+        // Extra arguments are ignored by the engine, never flagged.
+        let tree = parse("main()\n{\n\tx = sin( 30, 40 );\n}\n");
+        assert!(compile(&tree, "main()\n{\n\tx = sin( 30, 40 );\n}\n").is_ok());
         // Variadics are never flagged.
         let tree = parse("main()\n{\n\tprintln( \"a\", \"b\", 1 );\n}\n");
         assert!(compile(&tree, "main()\n{\n\tprintln( \"a\", \"b\", 1 );\n}\n").is_ok());
