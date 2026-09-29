@@ -244,8 +244,29 @@ impl Backend {
         (start, end)
     }
 
+    /// Parse `text` and store the tree, functions, symbols and content
+    /// under `uri` without publishing diagnostics. Used for scripts that
+    /// were not opened by the client: workspace files read from disk and
+    /// scripts loaded from `.pk3` archives.
+    pub(crate) async fn parse_and_store(&self, uri: Uri, text: &str) -> bool
+    {
+        let tree = {
+            self.parser.lock().await.parse(text, None)
+        };
+        let Some(tree) = tree else {
+            return false;
+        };
+        let fns = Self::extract_fns(&tree, text);
+        let syms = Self::extract_syms(&tree, text);
+        self.trees.lock().await.insert(uri.clone(), tree);
+        self.fn_defs.lock().await.insert(uri.clone(), fns);
+        self.sym_defs.lock().await.insert(uri.clone(), syms);
+        self.docs_content.lock().await.insert(uri, text.to_string());
+        true
+    }
+
     /// Get function definitions from parsed trees
-    fn extract_fns(tree: &Tree, source: &str) -> HashMap<String, (Range, Option<String>)>
+    pub(crate) fn extract_fns(tree: &Tree, source: &str) -> HashMap<String, (Range, Option<String>)>
     {
         let mut fns: HashMap<String, (Range, Option<String>)> = HashMap::new();
         let root = tree.root_node();
@@ -285,7 +306,7 @@ impl Backend {
         fns
     }
 
-    fn extract_syms(tree: &Tree, src: &str) -> Vec<DocumentSymbol>
+    pub(crate) fn extract_syms(tree: &Tree, src: &str) -> Vec<DocumentSymbol>
     {
         let mut symbols: Vec<DocumentSymbol> = Vec::new();
         let root = tree.root_node();

@@ -1,4 +1,6 @@
 /target
+# Brenz pk3 index cache
+.cache/
 # Brenz project file
 .brenz
 *~

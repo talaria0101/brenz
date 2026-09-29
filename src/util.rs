@@ -77,18 +77,7 @@ pub(crate) fn resolove_scr_path(
 pub(crate) fn init_cfg() -> io::Result<PathBuf>
 {
     let base = std::env::current_dir()?;
-    let f = base.join(".brenz");
-    if f.exists() {
-        return Err(io::Error::new(io::ErrorKind::AlreadyExists, ".brenz file already exists"));
-    }
-
-    let content = r#"# Brenz project file
-# Currently this file is only being used to tell the root of your project.
-# In future, it will be used for configuration like `.clangd` for clangd server.
-"#;
-    std::fs::write(f, content)?;
-
-    Ok(base)
+    crate::config::BrenzConfig::init_in(&base)
 }
 
 pub(crate) fn get_data_dir() -> io::Result<PathBuf>

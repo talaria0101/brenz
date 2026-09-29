@@ -1,0 +1,23 @@
+[package]
+name = "tree-sitter-gsc"
+description = "Call of Duty (2003) GSC script parser"
+version = "0.1.0"
+authors = ["Kazam <mrcreamy112233@gmail.com>"]
+license = "GNU GPLv3"
+repository = "https://gitlab.com/kazam0180/cod1-gsc-parser"
+keywords = ["incremental", "parsing", "tree-sitter", "gsc"]
+categories = ["parser-implementations", "parsing", "text-editors"]
+edition = "2024"
+autoexamples = false
+
+build = "bindings/rust/build.rs"
+
+[lib]
+path = "bindings/rust/lib.rs"
+
+[dependencies]
+tree-sitter = "0.26.3"
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1.2"

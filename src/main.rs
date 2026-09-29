@@ -9,9 +9,11 @@ mod backend;
 use backend::Backend;
 mod brace;
 mod compiler;
+mod config;
 mod util;
 use util::{logprint, LogType};
 mod doc;
+mod pk3;
 
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult, jsonrpc::Error>
@@ -47,6 +49,21 @@ impl LanguageServer for Backend {
         }
 
         *self.workspace_root.lock().await = workspace_root;
+
+        // Load the `.brenz` project config, then (re)build the `.pk3`
+        // index for the configured game paths. Only the central
+        // directory of each archive is read, so this stays fast.
+        let root = self.workspace_root.lock().await.clone();
+        let cfg = crate::config::BrenzConfig::load(root.as_ref());
+        if !cfg.game_paths.is_empty() {
+            self.client.log_message(
+                MessageType::INFO,
+                format!("Brenz: game paths: {:?}", cfg.game_paths)
+            ).await;
+        }
+        let index = crate::pk3::Pk3Index::load_or_build(root.as_ref(), &cfg.game_paths);
+        *self.config.lock().await = cfg;
+        *self.pk3_index.lock().await = index;
 
         logprint!(LogType::Info, "Brenz initializing");
         Ok(InitializeResult {
