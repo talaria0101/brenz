@@ -6,7 +6,7 @@
 //! `.brenz` config are searched for it, case-insensitively.
 //!
 //! The archive listing (which `.pk3` holds which script) is cached in
-//! `<workspace>/.cache/brenz/pk3_index.toml`, clangd style, and refreshed
+//! `<workspace>/.cache/brenz/pk3_index.ron`, clangd style, and refreshed
 //! from the per-archive size plus modification time: only new, removed or
 //! changed archives are re-scanned.
 
@@ -23,7 +23,9 @@ use crate::util::{LogType, logprint};
 /// Where the index cache lives, relative to the workspace root.
 const CACHE_DIR_NAME: &str = ".cache";
 const CACHE_SUBDIR_NAME: &str = "brenz";
-const CACHE_FILE_NAME: &str = "pk3_index.toml";
+const CACHE_FILE_NAME: &str = "pk3_index.ron";
+/// Previous cache file name, removed once the RON cache is written.
+const OLD_CACHE_FILE_NAME: &str = "pk3_index.toml";
 
 /// One script found inside one archive.
 #[derive(Debug, Clone)]
@@ -379,7 +381,7 @@ impl PendingCache {
 
 fn read_cache(path: &Path, game_paths: &[PathBuf]) -> Option<PendingCache> {
     let content = std::fs::read_to_string(path).ok()?;
-    let file: Pk3CacheFile = toml::from_str(&content).ok()?;
+    let file: Pk3CacheFile = ron::from_str(&content).ok()?;
     if file.game_paths != game_paths {
         return None;
     }
@@ -396,9 +398,12 @@ fn write_cache(path: &Path, file: &Pk3CacheFile) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let content =
-        toml::to_string_pretty(file).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, content)
+    let content = ron::ser::to_string_pretty(file, ron::ser::PrettyConfig::new().struct_names(true))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    std::fs::write(path, content)?;
+    // Drop the artifact of the old TOML cache, if present.
+    let _ = std::fs::remove_file(path.with_file_name(OLD_CACHE_FILE_NAME));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -522,7 +527,7 @@ mod tests {
         make_pk3(&games, "pak0.pk3", &[("maps/mp/dm.gsc", "main() {}\n")]);
         let first = Pk3Index::load_or_build(Some(&root), &[games.clone()]);
         assert_eq!(first.entry_count(), 1);
-        let cache_file = root.join(".cache/brenz/pk3_index.toml");
+        let cache_file = root.join(".cache/brenz/pk3_index.ron");
         assert!(cache_file.exists());
         let second = Pk3Index::load_or_build(Some(&root), &[games]);
         assert_eq!(second.entry_count(), 1);

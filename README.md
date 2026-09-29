@@ -16,12 +16,14 @@ brenz --init
 Run Brenz with `--backtrace` argument to get a backtrace for errors.
 
 ## Configuration
-The `.brenz` file in your project root is a TOML config, like `.clangd`
-for clangd. It currently holds one field:
+The `.brenz` file in your project root is a RON config. It currently
+holds one field:
 
-```toml
-# Game installation directories to resolve scripts from `.pk3` archives.
-game_paths = ["/home/user/games/cod"]
+```ron
+// Game installation directories to resolve scripts from `.pk3` archives.
+(
+    game_paths: ["/home/user/games/cod"],
+)
 ```
 
 When a script references another script (e.g. `maps\mp\_utility::foo`)
@@ -33,6 +35,6 @@ one path (so `pak1.pk3` overrides `pak0.pk3`). A found script is parsed
 too, so its own dependencies resolve as well. Go-to-definition on such scripts points at
 `pk3://...` locations backed by the archive contents.
 
-The archive listing is cached in `.cache/brenz/pk3_index.toml` inside the
+The archive listing is cached in `.cache/brenz/pk3_index.ron` inside the
 project (clangd style) and refreshed automatically: only new, removed or
 changed archives are re-scanned.

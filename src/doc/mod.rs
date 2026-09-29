@@ -1,6 +1,5 @@
 //! Documentation for various functions and keywords
-static BUILTINS: &str = include_str!("../assets/builtins.json");
-static BUILTINS_SCHEMA: &str = include_str!("../assets/brenz-builtins-schema.json");
+static BUILTINS: &str = include_str!("../assets/builtins.ron");
 
 use serde::{Deserialize, Serialize};
 use tower_lsp_server::lsp_types::Hover;
@@ -147,7 +146,7 @@ pub enum GscType {
     Struct,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct Builtins {
     #[serde(deserialize_with = "deserialize_lower_map")]
     pub functions: HashMap<String, ScrFunction>,
@@ -167,28 +166,27 @@ impl Backend {
     {
         let data_dir = util::get_data_dir().unwrap();
         let docs_dir = data_dir.join("docs");
-        let fns_file = docs_dir.join("builtins.json");
-        let sch_file = docs_dir.join("brenz-builtins-schema.json");
+        let fns_file = docs_dir.join("builtins.ron");
         if !docs_dir.exists() {
             fs::create_dir_all(&docs_dir).unwrap();
         }
         if !fns_file.exists() {
             fs::write(fns_file, BUILTINS).expect("Couldn't write builtin functions to file");
         }
-        if !sch_file.exists() {
-            fs::write(sch_file, BUILTINS_SCHEMA).expect("Couldn't write builtin schema to file");
-        }
+        // Drop the artifacts of the old JSON format, if present.
+        let _ = fs::remove_file(docs_dir.join("builtins.json"));
+        let _ = fs::remove_file(docs_dir.join("brenz-builtins-schema.json"));
     }
 
     pub(crate) async fn load_docs(&self)
     {
         let data_dir = util::get_data_dir().unwrap();
         let docs_dir = data_dir.join("docs");
-        let fns_file = docs_dir.join("builtins.json");
+        let fns_file = docs_dir.join("builtins.ron");
 
         let content = tokio::fs::read_to_string(fns_file).await
             .expect("Couldn't read builtin functions file");
-        let builtins: Builtins = serde_json::from_str(&content)
+        let builtins: Builtins = ron::from_str(&content)
             .expect("Couldn't parse builtin functions file");
 
         *self.builtins_doc.lock().await = builtins;
@@ -220,3 +218,23 @@ impl Backend {
         self.identifier_hover_info_get_hover(txt)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtins_ron_parses_and_covers_coduomp() {
+        let b: Builtins = ron::from_str(BUILTINS).expect("builtins.ron must parse");
+        // coduomp: 120 script functions, 172 script methods (plus aliases).
+        assert!(b.functions.len() >= 120, "functions: {}", b.functions.len());
+        assert!(b.methods.len() >= 172, "methods: {}", b.methods.len());
+        for key in ["spawn", "getent", "isdefined", "objective_add", "precachemodel"] {
+            assert!(b.functions.contains_key(key), "missing function {key}");
+        }
+        for key in ["settext", "dodamage", "getstance", "fireturret", "suicide"] {
+            assert!(b.methods.contains_key(key), "missing method {key}");
+        }
+    }
+}
+

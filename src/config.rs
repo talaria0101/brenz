@@ -1,14 +1,16 @@
 //! Project configuration stored in the `.brenz` file.
 //!
-//! The `.brenz` file lives in the workspace root and uses TOML syntax,
-//! similar to how `.clangd` configures clangd. Currently it holds:
+//! The `.brenz` file lives in the workspace root and uses RON syntax,
+//! like the builtin docs. It currently holds:
 //!
-//! ```toml
-//! # Brenz project file.
-//! # Point Brenz at your game installation(s) so scripts shipped inside
-//! # `.pk3` archives can be resolved, e.g.:
-//! # game_paths = ["C:/Program Files/Call of Duty", "/home/user/games/cod"]
-//! game_paths = []
+//! ```ron
+//! // Brenz project file.
+//! // Point Brenz at your game installation(s) so scripts shipped inside
+//! // `.pk3` archives can be resolved, e.g.:
+//! // game_paths: ["C:/Program Files/Call of Duty", "/home/user/games/cod"],
+//! (
+//!     game_paths: [],
+//! )
 //! ```
 //!
 //! Unknown fields are ignored so newer Brenz versions can extend the file
@@ -35,11 +37,13 @@ pub(crate) struct BrenzConfig {
 impl BrenzConfig {
     /// Template written by `brenz --init`.
     pub(crate) fn template() -> &'static str {
-        r#"# Brenz project file (TOML configuration).
-# Point Brenz at your game installation(s) so scripts shipped inside
-# `.pk3` archives can be resolved, e.g.:
-# game_paths = ["C:/Program Files/Call of Duty", "/home/user/games/cod"]
-game_paths = []
+        r#"// Brenz project file (RON configuration).
+// Point Brenz at your game installation(s) so scripts shipped inside
+// `.pk3` archives can be resolved, e.g.:
+// game_paths: ["C:/Program Files/Call of Duty", "/home/user/games/cod"],
+(
+    game_paths: [],
+)
 "#
     }
 
@@ -65,14 +69,22 @@ game_paths = []
                 return Self::default();
             }
         };
-        match toml::from_str::<BrenzConfig>(&content) {
+        match ron::from_str::<BrenzConfig>(&content) {
             Ok(cfg) => cfg,
             Err(e) => {
-                logprint!(
-                    LogType::Error,
-                    "Couldn't parse {}: {e}",
-                    path.display()
-                );
+                if content.contains("game_paths =") {
+                    logprint!(
+                        LogType::Error,
+                        "{} is in the old TOML format, rewrite it as RON (see `brenz --init`): {e}",
+                        path.display()
+                    );
+                } else {
+                    logprint!(
+                        LogType::Error,
+                        "Couldn't parse {}: {e}",
+                        path.display()
+                    );
+                }
                 Self::default()
             }
         }
@@ -98,14 +110,14 @@ mod tests {
 
     #[test]
     fn template_parses_to_empty_config() {
-        let cfg: BrenzConfig = toml::from_str(BrenzConfig::template()).unwrap();
+        let cfg: BrenzConfig = ron::from_str(BrenzConfig::template()).unwrap();
         assert!(cfg.game_paths.is_empty());
     }
 
     #[test]
     fn parses_game_paths() {
         let cfg: BrenzConfig =
-            toml::from_str("game_paths = [\"/games/cod\", \"C:/CoD\"]").unwrap();
+            ron::from_str("(game_paths: [\"/games/cod\", \"C:/CoD\"])").unwrap();
         assert_eq!(
             cfg.game_paths,
             vec![
@@ -118,7 +130,7 @@ mod tests {
     #[test]
     fn ignores_unknown_fields() {
         let cfg: BrenzConfig =
-            toml::from_str("game_paths = []\nfuture_option = 42").unwrap();
+            ron::from_str("(game_paths: [], future_option: 42)").unwrap();
         assert!(cfg.game_paths.is_empty());
     }
 
@@ -131,7 +143,15 @@ mod tests {
     #[test]
     fn broken_file_gives_default() {
         let dir = crate::pk3::test_helpers::fresh_temp_dir("brenz_cfg");
-        std::fs::write(dir.join(CONFIG_FILE_NAME), "game_paths = [oops\n").unwrap();
+        std::fs::write(dir.join(CONFIG_FILE_NAME), "(game_paths: [oops\n").unwrap();
+        let cfg = BrenzConfig::load(Some(&dir));
+        assert!(cfg.game_paths.is_empty());
+    }
+
+    #[test]
+    fn old_toml_file_gives_default() {
+        let dir = crate::pk3::test_helpers::fresh_temp_dir("brenz_cfg_toml");
+        std::fs::write(dir.join(CONFIG_FILE_NAME), "game_paths = []\n").unwrap();
         let cfg = BrenzConfig::load(Some(&dir));
         assert!(cfg.game_paths.is_empty());
     }
