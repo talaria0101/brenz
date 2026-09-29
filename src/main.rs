@@ -484,7 +484,10 @@ impl LanguageServer for Backend {
                 continue;
             }
             let mut item = Self::comp_item_for_builtin(k, scr_fn, snippet);
-            item.sort_text = Some(format!("1-{:04}-{k}", 9999 - score.min(9999)));
+            item.sort_text = Some(format!(
+                "1-{:07}-{k}",
+                comp::SCORE_SORT_MAX - score.min(comp::SCORE_SORT_MAX)
+            ));
             suggestions.push(item);
         }
 
@@ -494,7 +497,10 @@ impl LanguageServer for Backend {
                 continue;
             }
             let mut item = Self::comp_item_for_builtin(k, scr_md, snippet);
-            item.sort_text = Some(format!("1-{:04}-{k}", 9999 - score.min(9999)));
+            item.sort_text = Some(format!(
+                "1-{:07}-{k}",
+                comp::SCORE_SORT_MAX - score.min(comp::SCORE_SORT_MAX)
+            ));
             suggestions.push(item);
         }
 
@@ -510,8 +516,9 @@ impl LanguageServer for Backend {
                         insert_text: Some(text),
                         insert_text_format: format,
                         sort_text: Some(format!(
-                            "1-{:04}-{}",
-                            9999 - comp::fuzzy_score(prefix, &sym.name).min(9999),
+                            "1-{:07}-{}",
+                            comp::SCORE_SORT_MAX
+                                - comp::fuzzy_score(prefix, &sym.name).min(comp::SCORE_SORT_MAX),
                             sym.name.to_lowercase()
                         )),
                         ..Default::default()
@@ -542,8 +549,8 @@ impl LanguageServer for Backend {
                             kind: Some(CompletionItemKind::VARIABLE),
                             detail: Some(detail),
                             sort_text: Some(format!(
-                                "{tier}-{:04}-{}",
-                                9999 - score.min(9999),
+                                "{tier}-{:07}-{}",
+                                comp::SCORE_SORT_MAX - score.min(comp::SCORE_SORT_MAX),
                                 var.name.to_lowercase()
                             )),
                             ..Default::default()

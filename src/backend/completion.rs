@@ -325,21 +325,48 @@ fn arg_index_at(list: &Node, _src: &str, byte: usize) -> usize {
     index
 }
 
-/// Case-insensitive match quality: 100 for prefix, 50 for substring,
-/// 0 otherwise. An empty prefix accepts everything weakly.
+/// Match tiers. Prefix beats substring beats fuzzy wandering, and
+/// everything stays below the next tier so ordering never mixes.
+pub(crate) const SCORE_PREFIX: u32 = 1_000_000;
+pub(crate) const SCORE_SUBSTRING: u32 = 500_000;
+const SCORE_FUZZY_MAX: u32 = 499_999;
+/// Width for descending score keys: `SCORE_SORT_MAX - score`.
+pub(crate) const SCORE_SORT_MAX: u32 = 1_000_000;
+
+/// Case-insensitive match quality: prefix, then substring, then a
+/// nucleo subsequence score for typos. Empty prefix accepts
+/// everything weakly. Non-ASCII falls back to plain matching,
+/// since nucleo's ASCII view requires ASCII bytes.
 pub(crate) fn fuzzy_score(prefix: &str, name: &str) -> u32 {
     if prefix.is_empty() {
         return 1;
     }
+    // Fast paths stay exact and cheap: most keystrokes never reach
+    // the matcher below.
     let lower = name.to_lowercase();
     let prefix = prefix.to_lowercase();
     if lower.starts_with(&prefix) {
-        100
-    } else if lower.contains(&prefix) {
-        50
-    } else {
-        0
+        return SCORE_PREFIX;
     }
+    if lower.contains(&prefix) {
+        return SCORE_SUBSTRING;
+    }
+    // Subsequence typos go through nucleo, scaled to stay below a
+    // plain substring hit. The matcher is built per call; the fast
+    // paths above mean it only runs on the interesting tail.
+    // (`prefer_prefix` would suit completion, but the config is
+    // non-exhaustive; DEFAULT already ignores case.)
+    if !prefix.is_ascii() || !name.is_ascii() {
+        return 0;
+    }
+    let mut matcher = nucleo::Matcher::new(nucleo::Config::DEFAULT);
+    matcher
+        .fuzzy_match(
+            nucleo::Utf32Str::Ascii(name.as_bytes()),
+            nucleo::Utf32Str::Ascii(prefix.as_bytes()),
+        )
+        .map(|s| (s as u32).min(SCORE_FUZZY_MAX))
+        .unwrap_or(0)
 }
 
 /// `name(p1, p2)` for plain text, `name(${1:p1}, ${2:p2})` when the
@@ -406,12 +433,16 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_ranks_prefix_over_substring() {
+    fn fuzzy_ranks_prefix_over_substring_over_typo() {
+        use super::{SCORE_PREFIX, SCORE_SUBSTRING};
         assert_eq!(fuzzy_score("", "anything"), 1);
-        assert_eq!(fuzzy_score("get", "getEnt"), 100);
-        assert_eq!(fuzzy_score("ent", "getEnt"), 50);
+        assert_eq!(fuzzy_score("get", "getEnt"), SCORE_PREFIX);
+        assert_eq!(fuzzy_score("ent", "getEnt"), SCORE_SUBSTRING);
+        assert_eq!(fuzzy_score("GET", "getEnt"), SCORE_PREFIX);
         assert_eq!(fuzzy_score("xyz", "getEnt"), 0);
-        assert_eq!(fuzzy_score("GET", "getEnt"), 100);
+        // Transposed letters still match, below any substring hit.
+        let typo = fuzzy_score("gte", "getEnt");
+        assert!(typo > 0 && typo < SCORE_SUBSTRING, "{typo}");
     }
 
     #[test]
