@@ -1,9 +1,12 @@
 //! Checks for mismatching brackets and quotes to give friendlier diagnostics.
 //!
-//! Mostly done by Claude
+//! A single byte-offset scan that understands GSC strings and both
+//! comment styles. Positions convert through the shared helper, so they
+//! agree with the tree-sitter diagnostics.
 
-use tower_lsp_server as tower_lsp;
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp_server::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
+
+use crate::compiler::compile::byte_range_to_range;
 
 #[derive(Debug, Clone)]
 pub struct SyntaxError {
@@ -15,8 +18,9 @@ pub struct SyntaxError {
 ///
 /// TODO: Give this guy a better name, merge requests are welcome
 pub struct BracketChecker {
-    stack: Vec<(char, usize, Position)>, // (bracket, byte_pos, lsp_position)
+    stack: Vec<(char, usize)>, // (bracket, byte offset)
     errors: Vec<SyntaxError>,
+    src: String,
 }
 
 impl BracketChecker {
@@ -24,123 +28,132 @@ impl BracketChecker {
         Self {
             stack: Vec::new(),
             errors: Vec::new(),
+            src: String::new(),
         }
     }
 
     pub fn check(&mut self, source: &str) -> Vec<SyntaxError> {
         self.stack.clear();
         self.errors.clear();
+        self.src = source.to_string();
 
-        let mut chars = source.char_indices().peekable();
+        let bytes = source.as_bytes();
+        let mut i = 0;
         let mut in_string = false;
-        let mut string_start: Option<(usize, Position)> = None;
+        let mut string_start = 0;
 
-        let mut line = 0u32;
-        let mut col = 0u32;
-
-        while let Some((pos, ch)) = chars.next() {
-            let current_pos = Position::new(line, col);
-
+        while i < bytes.len() {
+            let ch = bytes[i] as char;
+            // ASCII fast path: every structural character is ASCII, and
+            // anything else cannot affect brackets, strings or comments.
+            if !ch.is_ascii() {
+                i += 1;
+                while i < bytes.len() && !source.is_char_boundary(i) {
+                    i += 1;
+                }
+                continue;
+            }
             match ch {
                 '\n' => {
-                    // If we're in a string when we hit a newline, that's likely an unclosed string
+                    // Strings cannot span lines in GSC.
                     if in_string {
-                        if let Some((_, start_pos)) = string_start {
-                            self.errors.push(SyntaxError {
-                                range: Range::new(start_pos, Position::new(start_pos.line, start_pos.character + 1)),
-                                             message: "Unclosed string literal - strings cannot span multiple lines".to_string(),
-                            });
-                            in_string = false;
-                            string_start = None;
-                        }
+                        self.error(
+                            string_start,
+                            string_start + 1,
+                            "Unclosed string literal - strings cannot span multiple lines",
+                        );
+                        in_string = false;
                     }
-                    line += 1;
-                    col = 0;
-                    continue;
+                    i += 1;
+                }
+                '"' if in_string => {
+                    in_string = false;
+                    i += 1;
                 }
                 '"' => {
-                    if in_string {
-                        in_string = false;
-                        string_start = None;
-                    } else {
-                        in_string = true;
-                        string_start = Some((pos, current_pos));
-                    }
+                    in_string = true;
+                    string_start = i;
+                    i += 1;
                 }
                 '\\' if in_string => {
-                    // Skip escaped character
-                    if let Some((_, next_ch)) = chars.next() {
-                        if next_ch == '\n' {
-                            line += 1;
-                            col = 0;
-                        } else {
-                            col += 1;
-                        }
+                    // Skip the escaped character, whatever it is.
+                    i += 1;
+                    if i < bytes.len() {
+                        i += 1;
                     }
                 }
-                '/' if !in_string => {
-                    if chars.peek().map(|(_, c)| *c) == Some('/') {
-                        // Line comment - skip until next line
-                        chars.next(); // consume second '/'
-                        col += 1;
-                        while let Some((_, next_ch)) = chars.next() {
-                            if next_ch == '\n' {
-                                line += 1;
-                                col = 0;
-                                break;
-                            }
-                        }
-                        continue;
+                '/' if !in_string && bytes.get(i + 1) == Some(&b'/') => {
+                    // Line comment: skip to the newline.
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
                     }
-                    else if chars.peek().map(|(_, c)| *c) == Some('*') {
-                        // Block comment - skip until '*/'
-                        chars.next(); // consume '*'
-                        col += 1;
-                        while let Some((_, next_ch)) = chars.next() {
-                            if next_ch == '\n' {
-                                line += 1;
-                                col = 0;
-                            }
-                            else if next_ch == '*' {
-                                if chars.peek().map(|(_, c)| *c) == Some('/') {
-                                    // Block comment ended
-                                    chars.next(); // consume '/'
-                                    col += 1;
-                                    break;
-                                }
-                            }
-                            else {
-                                col += 1;
-                            }
+                }
+                '/' if !in_string && bytes.get(i + 1) == Some(&b'*') => {
+                    // Block comment: skip to `*/`, or report it.
+                    let open = i;
+                    i += 2;
+                    let mut closed = false;
+                    while i < bytes.len() {
+                        if bytes[i] == b'\n' {
+                            i += 1;
+                        } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                            i += 2;
+                            closed = true;
+                            break;
+                        } else {
+                            i += 1;
                         }
-                        continue;
+                    }
+                    if !closed {
+                        self.error(open, open + 2, "Unclosed block comment - expected '*/'");
                     }
                 }
                 '(' | '[' | '{' if !in_string => {
-                self.stack.push((ch, pos, current_pos));
+                    self.stack.push((ch, i));
+                    i += 1;
                 }
                 ')' | ']' | '}' if !in_string => {
-                    self.check_closing_bracket(ch, pos, current_pos);
+                    self.check_closing_bracket(ch, i);
+                    i += 1;
                 }
-                _ => {}
+                _ => {
+                    i += 1;
+                }
             }
-
-            col += ch.len_utf8() as u32;
         }
 
-        // Check for unclosed brackets and strings
-        self.check_unclosed_first();
-        if let Some((_, start_pos)) = string_start {
-            self.errors.push(SyntaxError {
-                range: Range::new(start_pos, Position::new(line, col)),
-                message: "Unclosed string literal".to_string(),
-            });
+        // Every unclosed opener gets its own diagnostic, innermost first.
+        while let Some((open_ch, open_at)) = self.stack.pop() {
+            self.error(
+                open_at,
+                open_at + 1,
+                &format!(
+                    "Unclosed '{}' - expected '{}'",
+                    open_ch,
+                    Self::closing_for(open_ch)
+                ),
+            );
+        }
+        if in_string {
+            self.error(string_start, bytes.len(), "Unclosed string literal");
         }
 
         std::mem::take(&mut self.errors)
     }
 
-    fn check_closing_bracket(&mut self, ch: char, _pos: usize, current_pos: Position) {
+    fn error(&mut self, start: usize, end: usize, message: &str) {
+        // Byte offsets come from scanning this exact source, so they
+        // are always char boundaries except for pathological slicing,
+        // which the helper clamps by construction.
+        let end = end.min(self.src.len());
+        self.errors.push(SyntaxError {
+            range: byte_range_to_range(&self.src, start, end),
+            message: message.to_string(),
+        });
+    }
+
+    fn check_closing_bracket(&mut self, ch: char, pos: usize) {
         let expected = match ch {
             ')' => '(',
             ']' => '[',
@@ -149,38 +162,33 @@ impl BracketChecker {
         };
 
         match self.stack.pop() {
-            Some((open_ch, _, _open_pos)) if open_ch == expected => {
-                // Correct match
+            Some((open_ch, _)) if open_ch == expected => {
+                // Correct match.
             }
-            Some((open_ch, _, open_pos)) => {
-                // Mismatched bracket
-                self.errors.push(SyntaxError {
-                    range: Range::new(current_pos, Position::new(current_pos.line, current_pos.character + 1)),
-                    message: format!("Unclosed '{}' at line {}, expected a '{}' to close it",
-                            open_ch, open_pos.line + 1, Self::closing_for(open_ch)),
-                });
-                // Put it back and try to match with earlier brackets
-                self.stack.push((open_ch, 0, open_pos)); // byte pos not needed for error reporting
+            Some((open_ch, open_at)) => {
+                // Mismatched bracket: blame the closer, keep the opener
+                // for a later match, as the opener is usually the one
+                // that is still open.
+                let line = self.src[..open_at].chars().filter(|c| *c == '\n').count() + 1;
+                self.error(
+                    pos,
+                    pos + 1,
+                    &format!(
+                        "Unclosed '{}' at line {}, expected a '{}' to close it",
+                        open_ch,
+                        line,
+                        Self::closing_for(open_ch)
+                    ),
+                );
+                self.stack.push((open_ch, open_at));
             }
             None => {
-                // Extra closing bracket
-                self.errors.push(SyntaxError {
-                    range: Range::new(current_pos, Position::new(current_pos.line, current_pos.character + 1)),
-                    message: format!("Unexpected '{}' - no matching opening bracket", ch),
-                });
+                self.error(
+                    pos,
+                    pos + 1,
+                    &format!("Unexpected '{}' - no matching opening bracket", ch),
+                );
             }
-        }
-    }
-
-    fn check_unclosed_first(&mut self) -> bool {
-        if let Some((open_ch, _, open_pos)) = self.stack.pop() {
-            self.errors.push(SyntaxError {
-                range: Range::new(open_pos, Position::new(open_pos.line, open_pos.character + 1)),
-                message: format!("Unclosed '{}' - expected '{}'", open_ch, Self::closing_for(open_ch)),
-            });
-            true // Found an error
-        } else {
-            false // No unclosed brackets
         }
     }
 
@@ -191,6 +199,13 @@ impl BracketChecker {
             '{' => '}',
             _ => open_ch, // fallback
         }
+    }
+
+    /// Start position of a byte offset, for tests.
+    #[cfg(test)]
+    fn position_at(&self, byte: usize) -> (u32, u32) {
+        let pos = byte_range_to_range(&self.src, byte, byte).start;
+        (pos.line, pos.character)
     }
 }
 
@@ -210,5 +225,86 @@ impl From<SyntaxError> for Diagnostic {
             source: Some("bracket-checker".to_string()),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(src: &str) -> Vec<String> {
+        let mut checker = BracketChecker::new();
+        checker
+            .check(src)
+            .into_iter()
+            .map(|e| e.message)
+            .collect()
+    }
+
+    #[test]
+    fn clean_file_is_quiet() {
+        assert!(check("main()\n{\n\tx = ( 1 + [2] );\n\ts = \"a(b{c\";\n}\n").is_empty());
+        assert!(check("").is_empty());
+    }
+
+    #[test]
+    fn reports_every_unclosed_opener() {
+        let errs = check("main(\n{\n\tif ( x \n");
+        assert_eq!(errs.len(), 3, "{errs:?}");
+        assert!(errs.iter().all(|m| m.starts_with("Unclosed")));
+    }
+
+    #[test]
+    fn mismatch_keeps_opener() {
+        // A typo'd closer reports the mismatch; the opener stays open
+        // and is reported too if nothing closes it.
+        let errs = check("main()\n{\n\tx = (];\n}\n");
+        assert!(errs[0].contains("Unclosed '('"), "{errs:?}");
+    }
+
+    #[test]
+    fn extra_closer() {
+        let errs = check("main()\n{\n}\n}\n");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("Unexpected '}'"));
+    }
+
+    #[test]
+    fn unclosed_block_comment() {
+        // The swallowed `}` leaves `{` unclosed too: both are true.
+        let errs = check("main()\n{\n\t/* comment\n\tx = 1;\n}\n");
+        assert_eq!(errs.len(), 2, "{errs:?}");
+        assert!(errs[0].contains("Unclosed block comment"));
+    }
+
+    #[test]
+    fn brackets_in_strings_and_comments_ignored() {
+        assert!(check("main() // ( [ {\n{\n\ts = \"}])\";\n}\n").is_empty());
+        assert!(check("/* ( [ { */\nmain()\n{\n}\n").is_empty());
+    }
+
+    #[test]
+    fn escaped_quote_stays_in_string() {
+        assert!(check("main()\n{\n\ts = \"a\\\"(b\";\n}\n").is_empty());
+    }
+
+    #[test]
+    fn unclosed_string_at_newline_and_eof() {
+        let errs = check("main()\n{\n\ts = \"abc;\n}\n");
+        assert!(errs.iter().any(|m| m.contains("cannot span multiple lines")), "{errs:?}");
+        let errs = check("main()\n{\n\ts = \"abc;");
+        assert!(errs.iter().any(|m| m == "Unclosed string literal"), "{errs:?}");
+    }
+
+    #[test]
+    fn positions_agree_with_source() {
+        let mut checker = BracketChecker::new();
+        let src = "main(\n{\n}\n";
+        let errs = checker.check(src);
+        assert_eq!(errs.len(), 1);
+        // The unclosed `(` sits on line 0.
+        assert_eq!(errs[0].range.start.line, 0);
+        // ...and the helper maps bytes consistently.
+        assert_eq!(checker.position_at(6), (1, 0));
     }
 }
