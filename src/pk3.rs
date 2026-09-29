@@ -140,13 +140,13 @@ impl Pk3Index {
         self.entries.values().map(Vec::len).sum()
     }
 
-    /// Build the index for `game_paths`, reusing the on-disk cache in
+    /// Build the index for `pk3_paths`, reusing the on-disk cache in
     /// `<workspace_root>/.cache/brenz/` where the archives are unchanged.
     /// With no workspace root the index is built in memory only.
     /// Relative game paths resolve against the workspace root, so the
     /// server's working directory never matters.
-    pub(crate) fn load_or_build(workspace_root: Option<&PathBuf>, game_paths: &[PathBuf]) -> Self {
-        let game_paths: Vec<PathBuf> = game_paths
+    pub(crate) fn load_or_build(workspace_root: Option<&PathBuf>, pk3_paths: &[PathBuf]) -> Self {
+        let pk3_paths: Vec<PathBuf> = pk3_paths
             .iter()
             .map(|p| {
                 if p.is_absolute() {
@@ -158,8 +158,8 @@ impl Pk3Index {
                 }
             })
             .collect();
-        let game_paths = &game_paths;
-        let archives = list_pk3_archives(game_paths);
+        let pk3_paths = &pk3_paths;
+        let archives = list_pk3_archives(pk3_paths);
         if archives.is_empty() {
             return Self::default();
         }
@@ -170,7 +170,7 @@ impl Pk3Index {
                 .join(CACHE_FILE_NAME)
         });
 
-        let mut cached = cache_path.as_ref().and_then(|p| read_cache(p, game_paths));
+        let mut cached = cache_path.as_ref().and_then(|p| read_cache(p, pk3_paths));
 
         let mut index = Self::default();
         let mut fresh: Vec<CachedArchive> = Vec::new();
@@ -182,7 +182,7 @@ impl Pk3Index {
                 None => continue,
             };
             if let Some(reused) = cached.as_mut().and_then(|c| c.take_matching(&meta)) {
-                let order = dir_order_of(game_paths, &meta.path);
+                let order = dir_order_of(pk3_paths, &meta.path);
                 for e in &reused.entries {
                     index.insert(
                         &e.key,
@@ -230,7 +230,7 @@ impl Pk3Index {
 
         if let Some(path) = cache_path {
             let file = Pk3CacheFile {
-                game_paths: game_paths.to_vec(),
+                pk3_paths: pk3_paths.to_vec(),
                 archives: fresh,
             };
             if let Err(e) = write_cache(&path, &file) {
@@ -380,7 +380,7 @@ fn scan_archive(pk3: &Path) -> io::Result<Vec<(String, String)>> {
 #[derive(Debug, Serialize, Deserialize)]
 struct Pk3CacheFile {
     #[serde(default)]
-    game_paths: Vec<PathBuf>,
+    pk3_paths: Vec<PathBuf>,
     #[serde(default)]
     archives: Vec<CachedArchive>,
 }
@@ -419,10 +419,10 @@ impl PendingCache {
 /// Read the on-disk cache, or bail (`None`) when anything looks
 /// off: missing file, bad parse, or different game paths. A missed
 /// cache just means rescanning, never an error.
-fn read_cache(path: &Path, game_paths: &[PathBuf]) -> Option<PendingCache> {
+fn read_cache(path: &Path, pk3_paths: &[PathBuf]) -> Option<PendingCache> {
     let content = std::fs::read_to_string(path).ok()?;
     let file: Pk3CacheFile = ron::from_str(&content).ok()?;
-    if file.game_paths != game_paths {
+    if file.pk3_paths != pk3_paths {
         return None;
     }
     Some(PendingCache {

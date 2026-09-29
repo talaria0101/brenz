@@ -7,9 +7,9 @@
 //! // Brenz project file.
 //! // Point Brenz at your game installation(s) so scripts shipped inside
 //! // `.pk3` archives can be resolved, e.g.:
-//! // game_paths: ["C:/Program Files/Call of Duty", "/home/user/games/cod"],
+//! // pk3_paths: ["/home/user/games/cod/main", "/home/user/games/cod/uo"],
 //! (
-//!     game_paths: [],
+//!     pk3_paths: [],
 //! )
 //! ```
 //!
@@ -31,7 +31,7 @@ pub(crate) const CONFIG_FILE_NAME: &str = ".brenz";
 pub(crate) struct BrenzConfig {
     /// Game installation directories to search for `.pk3` archives.
     #[serde(default)]
-    pub game_paths: Vec<PathBuf>,
+    pub pk3_paths: Vec<PathBuf>,
 }
 
 impl BrenzConfig {
@@ -40,9 +40,9 @@ impl BrenzConfig {
         r#"// Brenz project file (RON configuration).
 // Point Brenz at your game installation(s) so scripts shipped inside
 // `.pk3` archives can be resolved, e.g.:
-// game_paths: ["C:/Program Files/Call of Duty", "/home/user/games/cod"],
+// pk3_paths: ["/home/user/games/cod/main", "/home/user/games/cod/uo"],
 (
-    game_paths: [],
+    pk3_paths: [],
 )
 "#
     }
@@ -104,43 +104,43 @@ mod tests {
     #[test]
     fn template_parses_to_empty_config() {
         let cfg: BrenzConfig = ron::from_str(BrenzConfig::template()).unwrap();
-        assert!(cfg.game_paths.is_empty());
+        assert!(cfg.pk3_paths.is_empty());
     }
 
     #[test]
     fn parses_game_paths() {
-        let cfg: BrenzConfig = ron::from_str("(game_paths: [\"/games/cod\", \"C:/CoD\"])").unwrap();
+        let cfg: BrenzConfig = ron::from_str("(pk3_paths: [\"/games/cod/main\", \"/games/cod/uo\"])").unwrap();
         assert_eq!(
-            cfg.game_paths,
-            vec![PathBuf::from("/games/cod"), PathBuf::from("C:/CoD")]
+            cfg.pk3_paths,
+            vec![PathBuf::from("/games/cod"), PathBuf::from("/games/cod/uo")]
         );
     }
 
     #[test]
     fn ignores_unknown_fields() {
         let cfg: BrenzConfig = ron::from_str("(game_paths: [], future_option: 42)").unwrap();
-        assert!(cfg.game_paths.is_empty());
+        assert!(cfg.pk3_paths.is_empty());
     }
 
     #[test]
     fn missing_file_gives_default() {
         let cfg = BrenzConfig::load(Some(&PathBuf::from("/definitely/not/a/real/dir")));
-        assert!(cfg.game_paths.is_empty());
+        assert!(cfg.pk3_paths.is_empty());
     }
 
     #[test]
     fn broken_file_gives_default() {
         let dir = crate::pk3::test_helpers::fresh_temp_dir("brenz_cfg");
-        std::fs::write(dir.join(CONFIG_FILE_NAME), "(game_paths: [oops\n").unwrap();
+        std::fs::write(dir.join(CONFIG_FILE_NAME), "(pk3_paths: [oops\n").unwrap();
         let cfg = BrenzConfig::load(Some(&dir));
-        assert!(cfg.game_paths.is_empty());
+        assert!(cfg.pk3_paths.is_empty());
     }
 
     #[test]
     fn old_toml_file_gives_default() {
         let dir = crate::pk3::test_helpers::fresh_temp_dir("brenz_cfg_toml");
-        std::fs::write(dir.join(CONFIG_FILE_NAME), "game_paths = []\n").unwrap();
+        std::fs::write(dir.join(CONFIG_FILE_NAME), "pk3_paths = []\n").unwrap();
         let cfg = BrenzConfig::load(Some(&dir));
-        assert!(cfg.game_paths.is_empty());
+        assert!(cfg.pk3_paths.is_empty());
     }
 }

@@ -1,8 +1,10 @@
 use chrono::{Datelike, Local, Timelike};
+use ron::ser::PrettyConfig;
 use std::fs::OpenOptions;
 use std::fs::create_dir_all;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 fn log_save(msg: &str) {
     // Best-effort debug log. Failures stay silent on purpose: logging
@@ -98,4 +100,12 @@ pub(crate) fn get_data_dir() -> io::Result<PathBuf> {
     }
 
     Ok(base)
+}
+
+pub fn ron_pcfg() -> &'static PrettyConfig {
+    static PC: LazyLock<PrettyConfig> = LazyLock::new(|| {
+        PrettyConfig::new().indentor("  ".to_owned())
+    });
+
+    &PC
 }

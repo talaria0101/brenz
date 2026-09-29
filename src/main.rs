@@ -29,12 +29,12 @@ impl LanguageServer for Backend {
         logprint!(
             LogType::Info,
             "Builtin functions: \n{}",
-            serde_json::to_string_pretty(&f).unwrap()
+            ron::ser::to_string_pretty(&f, util::ron_pcfg().to_owned()).unwrap()
         );
         logprint!(
             LogType::Info,
             "Builtin methods: \n{}",
-            serde_json::to_string_pretty(&m).unwrap()
+            ron::ser::to_string_pretty(&m, util::ron_pcfg().to_owned()).unwrap()
         );
         // Thanks to Claude for helping with workspace root
         self.client
@@ -80,15 +80,15 @@ impl LanguageServer for Backend {
         // directory of each archive is read, so this stays fast.
         let root = self.workspace_root.lock().await.clone();
         let cfg = crate::config::BrenzConfig::load(root.as_ref());
-        if !cfg.game_paths.is_empty() {
+        if !cfg.pk3_paths.is_empty() {
             self.client
                 .log_message(
                     MessageType::INFO,
-                    format!("Brenz: game paths: {:?}", cfg.game_paths),
+                    format!("Brenz: pk3 paths: {:?}", cfg.pk3_paths),
                 )
                 .await;
         }
-        let index = crate::pk3::Pk3Index::load_or_build(root.as_ref(), &cfg.game_paths);
+        let index = crate::pk3::Pk3Index::load_or_build(root.as_ref(), &cfg.pk3_paths);
         *self.config.lock().await = cfg;
         *self.pk3_index.lock().await = index;
 
