@@ -8,7 +8,7 @@ use std::path::PathBuf;
 mod backend;
 use backend::Backend;
 mod brace;
-mod interpreter;
+mod compiler;
 mod util;
 use util::{logprint, LogType};
 mod doc;
@@ -377,12 +377,14 @@ impl LanguageServer for Backend {
         };
 
         for (k, scr_fn) in f.iter() {
+            util::fmatch(prefix, k);
             if k.starts_with(prefix) {
                 suggestions.push(Self::comp_item_for_builtin(&k, scr_fn));
             }
         }
 
         for (k, scr_md) in m.iter() {
+            util::fmatch(prefix, k);
             if k.starts_with(prefix) {
                 suggestions.push(Self::comp_item_for_builtin(&k, scr_md));
             }

@@ -19,6 +19,19 @@ impl Backend {
         }
     }
 
+    // pub fn find_parent_of_kind_b4_kind<'a>(&self, mut node: Node<'a>, kind: &str, until: &str) -> Option<Node<'a>>
+    // {
+    //     loop {
+    //         if node.kind() == kind {
+    //             return Some(node);
+    //         }
+    //         else if node.kind() == until {
+    //             return None;
+    //         }
+    //         node = node.parent()?;
+    //     }
+    // }
+
     pub fn find_child_of_kind<'a>(&self, node: Node<'a>, kind: &str) -> Option<Node<'a>>
     {
         let mut cursor = node.walk();

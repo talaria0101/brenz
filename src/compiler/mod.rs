@@ -11,18 +11,18 @@ pub struct ScriptError
     pub message: String,
 }
 
-pub struct Interpreter
+pub struct Compiler
 {
     errors: Vec<ScriptError>,
 }
 
-impl Interpreter {
+impl Compiler {
     pub fn _new() -> Self {
         Self {
             errors: Vec::new(),
         }
     }
-    pub fn _interprete(_tree: &Tree) -> Vec<ScriptError>
+    pub fn _compile(_tree: &Tree) -> Vec<ScriptError>
     {
         Vec::new()
     }

@@ -10,6 +10,8 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use std::fmt::Debug;
 
+pub mod completion;
+
 use crate::brace::BracketChecker;
 use crate::doc::Builtins;
 

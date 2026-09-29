@@ -100,3 +100,16 @@ pub(crate) fn get_data_dir() -> io::Result<PathBuf>
 
     Ok(base)
 }
+
+pub fn fmatch(needle: &str, haystack: &str)
+{
+    // let mut results: Vec<String> = Vec::new();
+    let mut nucleo = nucleo::Matcher::new(nucleo::Config::DEFAULT);
+    use nucleo::Utf32Str;
+
+    // for item in haystack {
+        if let Some(score) = nucleo.fuzzy_match(Utf32Str::Ascii(haystack.as_bytes()), Utf32Str::Ascii(needle.as_bytes())) {
+            eprintln!("{}: {} score for {}", haystack, score, needle);
+        }
+    // }
+}

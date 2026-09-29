@@ -32,7 +32,7 @@ pub(crate) struct ScrFunction {
     pub info: String,
     pub params: Vec<ScrParam>,
     pub returns: Option<GscType>,
-    pub example: String,
+    pub example: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -43,7 +43,7 @@ pub(crate) struct ScrMethod {
     pub called_on: String,
     pub params: Vec<ScrParam>,
     pub returns: Option<GscType>,
-    pub example: String,
+    pub example: Option<String>,
 }
 
 impl ScriptCallable for ScrFunction {
@@ -76,7 +76,12 @@ impl ScriptCallable for ScrFunction {
     }
     fn example(&self) -> String
     {
-        self.example.clone()
+        if let Some(ref ex) = self.example {
+            ex.clone()
+        }
+        else {
+            "No example, consider contributing!".to_string()
+        }
     }
 }
 impl ScriptCallable for ScrMethod {
@@ -109,21 +114,26 @@ impl ScriptCallable for ScrMethod {
     }
     fn example(&self) -> String
     {
-        self.example.clone()
+        if let Some(ref ex) = self.example {
+            ex.clone()
+        }
+        else {
+            "No example, consider contributing!".to_string()
+        }
     }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub(crate) struct ScrParam {
-    name: String,
+pub struct ScrParam {
+    pub name: String,
     #[serde(rename = "type")]
-    ptype: GscType,
-    info: String,
+    pub ptype: GscType,
+    pub info: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum GscType {
+pub enum GscType {
     Any,
     Bool,
     Int,
@@ -133,6 +143,8 @@ pub(crate) enum GscType {
     Array,
     Vector,
     Entity,
+    HudElem,
+    Struct,
 }
 
 #[derive(Debug, Deserialize)]
