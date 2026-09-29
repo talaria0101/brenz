@@ -1,16 +1,19 @@
 //! Backend for our language server
-use tower_lsp_server as tower_lsp;
-use tower_lsp::Client;
-use tower_lsp::lsp_types::*;
-use tree_sitter::{Parser, Tree};
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
-use std::fmt::Debug;
+use tower_lsp::Client;
+use tower_lsp::lsp_types::*;
+use tower_lsp_server as tower_lsp;
+use tree_sitter::{Parser, Tree};
 
 pub mod completion;
+
+/// Function definitions per document: name to (range, doc comment).
+pub(crate) type FnDefs = HashMap<String, (Range, Option<String>)>;
 
 use crate::brace::BracketChecker;
 use crate::config::BrenzConfig;
@@ -34,7 +37,7 @@ pub struct Backend {
     /// Stores parsed trees for each document
     pub trees: Arc<Mutex<HashMap<Uri, Tree>>>,
     /// Function Definitions
-    pub fn_defs: Arc<Mutex<HashMap<Uri, HashMap<String, (Range, Option<String>)>>>>,
+    pub fn_defs: Arc<Mutex<HashMap<Uri, FnDefs>>>,
     /// Symbols
     pub sym_defs: Arc<Mutex<HashMap<Uri, Vec<DocumentSymbol>>>>,
     /// For storing text content of scripts
@@ -50,18 +53,21 @@ pub struct Backend {
 impl Debug for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Backend")
-        .field("client", &self.client)
-        .field("trees", &self.trees)
-        .finish()
+            .field("client", &self.client)
+            .field("trees", &self.trees)
+            .finish()
     }
 }
 
 impl Backend {
-    pub fn new(client: Client) -> Self
-    {
+    /// Fresh backend: parser loaded with the GSC grammar, everything
+    /// else empty until documents open and `initialize` runs.
+    pub fn new(client: Client) -> Self {
         let language = tree_sitter_gsc::LANGUAGE.into();
         let mut parser = Parser::new();
-        parser.set_language(&language).expect("Error loading GSC language");
+        parser
+            .set_language(&language)
+            .expect("Error loading GSC language");
 
         let backend = Self {
             client,
@@ -77,38 +83,38 @@ impl Backend {
             config: Arc::new(Mutex::new(BrenzConfig::default())),
             pk3_index: Arc::new(Mutex::new(Pk3Index::default())),
         };
-/*
-        let backend_ref = Arc::new(backend);
-        let backend_clone = backend_ref.clone();
+        /*
+                let backend_ref = Arc::new(backend);
+                let backend_clone = backend_ref.clone();
 
-        tokio::spawn(async move {
-            loop {
-                if parse_rx.changed().await.is_err() {
-                    break;
-                }
+                tokio::spawn(async move {
+                    loop {
+                        if parse_rx.changed().await.is_err() {
+                            break;
+                        }
 
-                let val = parse_rx.borrow().clone();
-                let Some((uri, text)) = val else { continue };
+                        let val = parse_rx.borrow().clone();
+                        let Some((uri, text)) = val else { continue };
 
-                // Debounce: wait 300ms, if another change came in during
-                // that time, the watch channel will have a new value
-                sleep(Duration::from_millis(300)).await;
+                        // Debounce: wait 300ms, if another change came in during
+                        // that time, the watch channel will have a new value
+                        sleep(Duration::from_millis(300)).await;
 
-                let latest = parse_rx.borrow().clone();
-                match latest {
-                    Some((latest_uri, latest_text)) if latest_uri == uri && latest_text == text => {
-                        backend_clone.parse_and_diagnose(uri, &text);
+                        let latest = parse_rx.borrow().clone();
+                        match latest {
+                            Some((latest_uri, latest_text)) if latest_uri == uri && latest_text == text => {
+                                backend_clone.parse_and_diagnose(uri, &text);
+                            }
+                            _ => continue
+                        }
                     }
-                    _ => continue
-                }
-            }
-        });
-*/
+                });
+        */
         backend
     }
 }
 
+mod diagnostics;
 mod helpers;
 mod navigation;
 mod parsing;
-mod diagnostics;

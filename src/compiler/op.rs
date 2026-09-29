@@ -87,21 +87,29 @@ pub(crate) enum Op {
 /// Immediate operand attached to an instruction.
 #[derive(Debug, Clone, Default)]
 pub(crate) enum Operand {
+    /// Most instructions need nothing beyond the opcode.
     #[default]
     None,
+    /// Integer and float literals ride along directly.
     Int(i32),
     Float(f32),
+    /// String literals, names, fields, and messages.
     Str(String),
     Slot(u32),
+    /// Absolute jump target, patched after emission.
     Addr(usize),
     Name(String),
     /// Builtin call with a fixed argument count known at compile time.
-    FuncCall { name: String, argc: usize },
+    FuncCall {
+        name: String,
+        argc: usize,
+    },
     /// Dynamic pointer call with the written argument count.
     Argc(usize),
 }
 
 impl Instr {
+    /// One instruction with its source position for error reports.
     pub(crate) fn new(op: Op, arg: Operand, pos: usize) -> Self {
         Self { op, arg, pos }
     }

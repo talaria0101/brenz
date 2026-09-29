@@ -17,8 +17,10 @@ use std::fmt;
 use std::rc::Rc;
 
 /// A runtime script value.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) enum Value {
+    /// Unset or missing. The default because fresh slots start here.
+    #[default]
     Undefined,
     Int(i32),
     Float(f32),
@@ -39,6 +41,8 @@ pub(crate) enum Value {
 }
 
 impl PartialEq for Value {
+    // Handle equality by identity (see above); everything else
+    // compares by value. Keeps cyclic values terminating.
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Undefined, Value::Undefined) => true,
@@ -60,6 +64,7 @@ impl PartialEq for Value {
 
 impl Value {
     pub(crate) fn type_name(&self) -> &'static str {
+        // The name users see in error messages. Lowercase, plain.
         match self {
             Value::Undefined => "undefined",
             Value::Int(_) => "int",
@@ -238,9 +243,7 @@ impl Value {
                 }
                 Ok(Value::Vec3(out))
             }
-            (Value::Str(x), Value::Str(y)) if op == '+' => {
-                Ok(Value::Str(format!("{x}{y}")))
-            }
+            (Value::Str(x), Value::Str(y)) if op == '+' => Ok(Value::Str(format!("{x}{y}"))),
             _ => Err(format!(
                 "pair has unmatching types '{}' and '{}'",
                 l.type_name(),
@@ -336,10 +339,13 @@ impl Value {
 }
 
 fn fmt_int(i: i32) -> String {
+    // Plain digits, no padding or decoration.
     i.to_string()
 }
 
 fn fmt_float(f: f32) -> String {
+    // Whole floats print without decimals (`2`, not `2.0`); the
+    // engine trims them the same way in messages.
     if f == f.trunc() && f.abs() < 1e15 {
         format!("{}", f as i64)
     } else {
@@ -348,10 +354,17 @@ fn fmt_float(f: f32) -> String {
 }
 
 fn fmt_vec(v: &[f32; 3]) -> String {
-    format!("({}, {}, {})", fmt_float(v[0]), fmt_float(v[1]), fmt_float(v[2]))
+    // Vectors print tuple-style, matching `println` output.
+    format!(
+        "({}, {}, {})",
+        fmt_float(v[0]),
+        fmt_float(v[1]),
+        fmt_float(v[2])
+    )
 }
 
 /// `atoi` semantics: optional sign, leading digits, else 0.
+/// The engine reads numbers this loosely, so the checker does too.
 fn atoi(text: &str) -> i32 {
     let t = text.trim();
     let (t, neg) = match t.strip_prefix(['+', '-']) {
@@ -364,6 +377,7 @@ fn atoi(text: &str) -> i32 {
 }
 
 /// `atof` semantics: leading numeric text parses, else fails.
+/// Same deal as `atoi`: trailing junk never stops the engine.
 pub(crate) fn atof(text: &str) -> Option<f32> {
     let mut t = text.trim();
     t = t.strip_prefix(['+', '-']).unwrap_or(t);
@@ -425,7 +439,7 @@ mod tests {
         assert!(Value::Int(3).truthy().unwrap());
         assert!(!Value::Int(0).truthy().unwrap());
         assert!(Value::Float(0.5).truthy().unwrap());
-        assert!(Value::Str("0".into()).truthy().unwrap() == false);
+        assert!(!Value::Str("0".into()).truthy().unwrap());
         assert!(Value::Str("abc".into()).truthy().is_err());
         assert!(Value::Undefined.truthy().is_err());
         assert!(Value::Vec3([1.0, 0.0, 0.0]).truthy().is_err());

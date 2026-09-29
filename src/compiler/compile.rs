@@ -18,10 +18,10 @@
 use std::collections::HashMap;
 use tree_sitter::Node;
 
+use super::ScriptError;
 use super::builtin;
 use super::op::{Instr, Op, Operand};
-use super::value::{is_zero_literal, Value};
-use super::ScriptError;
+use super::value::{Value, is_zero_literal};
 use crate::doc::{Builtins, GscType};
 use std::sync::OnceLock;
 
@@ -71,7 +71,9 @@ fn return_rep(t: &GscType) -> Option<Value> {
         Float => Some(Value::Float(0.0)),
         String => Some(Value::Str(::std::string::String::new())),
         LString => Some(Value::IStr(::std::string::String::new())),
-        Array => Some(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(Vec::new())))),
+        Array => Some(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            Vec::new(),
+        )))),
         Vector => Some(Value::Vec3([0.0; 3])),
         Entity => Some(Value::Entity),
         Any | HudElem | Struct => None,
@@ -109,16 +111,23 @@ fn arg_mismatch(expected: &GscType, actual: &Value, fname: &str, pname: &str) ->
     }
     let ok = match expected {
         Any | HudElem | Struct | LString => true,
-        Bool => matches!(actual, Value::Int(_) | Value::Float(_))
-            || matches!(actual, Value::Str(s) if castable_int_str(s)),
-        Int => matches!(actual, Value::Int(_) | Value::Float(_))
-            || matches!(actual, Value::Str(s) if castable_int_str(s)),
+        Bool => {
+            matches!(actual, Value::Int(_) | Value::Float(_))
+                || matches!(actual, Value::Str(s) if castable_int_str(s))
+        }
+        Int => {
+            matches!(actual, Value::Int(_) | Value::Float(_))
+                || matches!(actual, Value::Str(s) if castable_int_str(s))
+        }
         Float => {
             matches!(actual, Value::Int(_) | Value::Float(_))
                 || matches!(actual, Value::Str(s) if starts_numeric(s))
         }
         // `CastString` converts ints, floats and vectors.
-        String => matches!(actual, Value::Str(_) | Value::Int(_) | Value::Float(_) | Value::Vec3(_)),
+        String => matches!(
+            actual,
+            Value::Str(_) | Value::Int(_) | Value::Float(_) | Value::Vec3(_)
+        ),
         // `CastVector` accepts vectors only.
         Vector => matches!(actual, Value::Vec3(_)),
         Array => matches!(actual, Value::Array(_)),
@@ -161,6 +170,8 @@ struct Compiler<'a> {
 
 impl<'a> Compiler<'a> {
     fn new(src: &'a str) -> Self {
+        // Fresh compiler over one source string. Nothing carries over
+        // between files, so a bad run can never poison the next.
         Self {
             src,
             code: Vec::new(),
@@ -172,10 +183,14 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// The source slice behind a node. Tree-sitter offsets are byte
+    /// offsets into this exact string, so slicing never panics.
     fn text(&self, node: &Node<'a>) -> &'a str {
         &self.src[node.start_byte()..node.end_byte()]
     }
 
+    /// Record a diagnostic and keep going. One bad node never stops
+    /// the rest of the file from compiling.
     fn fail(&mut self, node: &Node, message: String) {
         self.errors.push(ScriptError {
             range: byte_range_to_range(self.src, node.start_byte(), node.end_byte()),
@@ -183,10 +198,13 @@ impl<'a> Compiler<'a> {
         });
     }
 
+    /// Push one instruction. Plain emits need no patching; jumps go
+    /// through `emit_jump` so their targets get filled in later.
     fn emit(&mut self, op: Op, arg: Operand, node: &Node<'a>) {
         self.code.push(Instr::new(op, arg, node.start_byte()));
     }
 
+    /// Push a operand-less instruction, the common case.
     fn emit_simple(&mut self, op: Op, node: &Node<'a>) {
         self.emit(op, Operand::None, node);
     }
@@ -199,6 +217,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn patch(&mut self, at: usize) {
+        // Point a placeholder jump at the next instruction to come.
+        // Every placeholder gets patched exactly once.
+        // Point a placeholder jump at the instruction about to be
+        // emitted. Every placeholder gets patched exactly once.
         let target = self.code.len();
         match &mut self.code[at].arg {
             Operand::Addr(a) => *a = target,
@@ -207,6 +229,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn patch_to(&mut self, at: usize, target: usize) {
+        // Same, but to a known address: loop ends and the places
+        // `continue` lands, which only exist after the body.
+        // Same as `patch`, but to an already-known address (loop ends
+        // and `continue` landing pads).
         match &mut self.code[at].arg {
             Operand::Addr(a) => *a = target,
             _ => panic!("patch of non-jump"),
@@ -228,6 +254,8 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// Named children only; anonymous tokens (braces, commas) are
+    /// just punctuation and never carry meaning here.
     fn named_children(&self, node: &Node<'a>) -> Vec<Node<'a>> {
         let mut out = Vec::new();
         let mut cursor = node.walk();
@@ -240,6 +268,8 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_program(mut self, tree: &'a tree_sitter::Tree) -> Result<Program, Vec<ScriptError>> {
+        // Two passes: names first so forward calls compile, bodies
+        // second, globals last as a synthetic `__globals` function.
         let root = tree.root_node();
         // Pre-register every function so forward references compile.
         let mut defs: Vec<(String, Vec<String>, Node)> = Vec::new();
@@ -270,10 +300,10 @@ impl<'a> Compiler<'a> {
             if self.functions.contains_key(name) {
                 // The engine rejects redefinition. Last body wins so
                 // later code still resolves, but it is reported.
-                if let Some(head) = node.child_by_field_name("func_head") {
-                    if let Some(name_node) = head.named_child(0) {
-                        self.fail(&name_node, format!("function '{name}' already defined"));
-                    }
+                if let Some(head) = node.child_by_field_name("func_head")
+                    && let Some(name_node) = head.named_child(0)
+                {
+                    self.fail(&name_node, format!("function '{name}' already defined"));
                 }
             }
             self.functions.insert(
@@ -321,6 +351,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_global_decl(&mut self, node: &Node<'a>) {
+        // `x = ...` at file scope. Runs once at startup, visible to
+        // every function through the global slots.
+        // Top-level `x = ...` lines run once at startup as `__globals`,
+        // so scripts can share setup without calling anything.
         let mut name = None;
         let mut value = None;
         for child in self.named_children(node) {
@@ -341,6 +375,9 @@ impl<'a> Compiler<'a> {
     }
 
     fn global_slot(&mut self, name: &str) -> u32 {
+        // Globals get stable indices shared across the whole program.
+        // Globals live in their own namespace beside locals; same
+        // name in both places refers to two different slots.
         if let Some(i) = self.globals.iter().position(|g| g == name) {
             return i as u32;
         }
@@ -351,6 +388,9 @@ impl<'a> Compiler<'a> {
     // -- locals ----------------------------------------------------
 
     fn local_slot(&mut self, name: &str) -> u32 {
+        // First mention claims the next free slot. Reading a name
+        // that was never written still resolves, it just reads
+        // `undefined` at runtime, like the engine.
         let cur = self.cur.as_mut().expect("no function");
         if let Some(i) = cur.locals.iter().position(|l| l == name) {
             return i as u32;
@@ -369,10 +409,10 @@ impl<'a> Compiler<'a> {
 
     /// Resolve a variable name: locals first, then globals.
     fn resolve(&mut self, name: &str) -> VarRef {
-        if let Some(cur) = self.cur.as_ref() {
-            if let Some(i) = cur.locals.iter().position(|l| l == name) {
-                return VarRef::Local(i as u32);
-            }
+        if let Some(cur) = self.cur.as_ref()
+            && let Some(i) = cur.locals.iter().position(|l| l == name)
+        {
+            return VarRef::Local(i as u32);
         }
         if let Some(i) = self.globals.iter().position(|g| g == name) {
             return VarRef::Global(i as u32);
@@ -381,6 +421,8 @@ impl<'a> Compiler<'a> {
     }
 
     fn emit_get_var(&mut self, r: &VarRef, node: &Node<'a>) {
+        // Push a variable's value. Never fails: unknown names push
+        // `undefined` instead of trapping.
         match r.clone() {
             VarRef::Local(i) => {
                 self.emit(Op::GetLocal, Operand::Slot(i), node);
@@ -415,6 +457,9 @@ impl<'a> Compiler<'a> {
     // -- functions -------------------------------------------------
 
     fn compile_function(&mut self, name: &str, node: &Node<'a>) {
+        // Parameters claim the first slots so argument binding is just
+        // positional copying. Falling off the end returns `undefined`,
+        // like falling off a script function.
         let entry = self.code.len();
         if let Some(info) = self.functions.get_mut(name) {
             info.entry = entry;
@@ -431,16 +476,18 @@ impl<'a> Compiler<'a> {
         }
         self.emit_simple(Op::GetUndefined, node);
         self.emit_simple(Op::Return, node);
-        if let Some(cur) = self.cur.take() {
-            if let Some(info) = self.functions.get_mut(name) {
-                info.slots = cur.locals.len();
-            }
+        if let Some(cur) = self.cur.take()
+            && let Some(info) = self.functions.get_mut(name)
+        {
+            info.slots = cur.locals.len();
         }
     }
 
     // -- statements --------------------------------------------------
 
     fn compile_block(&mut self, node: &Node<'a>) {
+        // A block is just its statements in order. No scopes: GSC
+        // locals live for the whole function call.
         // No early exit on errors: a language server reports every
         // problem at once, and `None`-poisoned static values already
         // suppress cascading follow-ups.
@@ -451,6 +498,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_stmt(&mut self, node: &Node<'a>) {
+        // Dispatch on statement kind. Blocks recurse; everything else
+        // lowers to jumps and stack code right here.
+        // One statement in, stack balanced coming out. Every arm keeps
+        // that promise or the VM drifts.
         match node.kind() {
             "expression_statement" => {
                 for child in self.named_children(node) {
@@ -570,14 +621,14 @@ impl<'a> Compiler<'a> {
                 self.emit_simple(Op::GetUndefined, node);
                 self.emit_simple(Op::DropTop, node);
             }
-            _ => self.fail(
-                node,
-                format!("cannot compile {} statement", node.kind()),
-            ),
+            _ => self.fail(node, format!("cannot compile {} statement", node.kind())),
         }
     }
 
     fn compile_continue(&mut self, node: &Node<'a>) {
+        // Walks outward past `switch` (which forwards) to the nearest
+        // real loop; direct jump when the target exists, placeholder
+        // when it only materializes later.
         enum Action {
             Direct(usize),
             Patch,
@@ -623,6 +674,8 @@ impl<'a> Compiler<'a> {
     }
 
     fn close_loop(&mut self, end: usize) {
+        // Pop the loop context and land every pending break (and
+        // deferred continue) on the loop end.
         let ctx = self.cur.as_mut().expect("no function").loops.pop().unwrap();
         for p in ctx.break_patches {
             self.patch_to(p, end);
@@ -633,6 +686,8 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_for(&mut self, node: &Node<'a>) {
+        // `for(;;)` is an unconditional loop; the finite form is
+        // init, test, body, update, with `continue` landing on update.
         let cond_node = node.child_by_field_name("loop_condition");
         let body = node.child_by_field_name("loop_block");
         let (Some(cond_node), Some(body)) = (cond_node, body) else {
@@ -697,6 +752,8 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_foreach(&mut self, node: &Node<'a>) {
+        // Desugared to an indexed while loop over a snapshot of the
+        // array, matching the quickfix the language server offers.
         let needle = node.child_by_field_name("needle");
         let hay = node.child_by_field_name("hay_stack");
         let (Some(needle), Some(hay_field)) = (needle, hay) else {
@@ -708,15 +765,19 @@ impl<'a> Compiler<'a> {
         // statement. Report it; codegen continues so nothing else is lost.
         self.fail(
             node,
-            "foreach is not supported in Call of Duty 1 / United Offensive GSC, use a for loop".to_string(),
+            "foreach is not supported in Call of Duty 1 / United Offensive GSC, use a for loop"
+                .to_string(),
         );
         let hay_id = hay_field.id();
         let needle_id = needle.id();
         let hay = self.peel(hay_field);
-        if let Some(v) = self.static_value(&hay) {
-            if !matches!(v, Value::Array(_)) {
-                self.fail(&hay, format!("foreach needs an array, got {}", v.type_name()));
-            }
+        if let Some(v) = self.static_value(&hay)
+            && !matches!(v, Value::Array(_))
+        {
+            self.fail(
+                &hay,
+                format!("foreach needs an array, got {}", v.type_name()),
+            );
         }
         self.compile_expr(&hay);
         let arr = self.temp_slot();
@@ -762,6 +823,8 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_switch(&mut self, node: &Node<'a>) {
+        // Two-section layout (tests, then bodies) gives C-like
+        // fallthrough for free: bodies simply run into each other.
         let tested = node.child_by_field_name("tested");
         let Some(tested) = tested else {
             self.fail(node, "bad switch statement".to_string());
@@ -840,7 +903,10 @@ impl<'a> Compiler<'a> {
                 continue;
             }
             if let Some(v) = clause.val.as_ref().and_then(|n| self.static_value(n)) {
-                if seen_cases.iter().any(|s| Value::equals(s, &v).unwrap_or(false)) {
+                if seen_cases
+                    .iter()
+                    .any(|s| Value::equals(s, &v).unwrap_or(false))
+                {
                     self.fail(
                         clause.val.as_ref().unwrap(),
                         "duplicate case expression".to_string(),
@@ -992,6 +1058,8 @@ impl<'a> Compiler<'a> {
     // -- expressions: each leaves exactly one value on the stack ---
 
     fn compile_expr(&mut self, node: &Node<'a>) {
+        // Every arm leaves exactly one value on the stack. That
+        // invariant is what keeps nested expressions balanced.
         let node = self.peel(*node);
         match node.kind() {
             "number" => self.compile_number(&node),
@@ -1025,10 +1093,10 @@ impl<'a> Compiler<'a> {
                 let mut n = 0;
                 for child in self.named_children(&node) {
                     let e = self.peel(child);
-                    if let Some(v) = self.static_value(&e) {
-                        if v.cast_float().is_err() {
-                            self.fail(&e, format!("vector needs numbers, got {}", v.type_name()));
-                        }
+                    if let Some(v) = self.static_value(&e)
+                        && v.cast_float().is_err()
+                    {
+                        self.fail(&e, format!("vector needs numbers, got {}", v.type_name()));
                     }
                     self.compile_expr(&e);
                     n += 1;
@@ -1135,7 +1203,9 @@ impl<'a> Compiler<'a> {
             }
             "boolean" => Some(Value::Int(i32::from(self.text(&node) == "true"))),
             "undefined" => Some(Value::Undefined),
-            "array" => Some(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(Vec::new())))),
+            "array" => Some(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+                Vec::new(),
+            )))),
             "vec1" => {
                 let mut out = None;
                 for child in self.named_children(&node) {
@@ -1181,7 +1251,9 @@ impl<'a> Compiler<'a> {
                 };
                 match op {
                     "&&" | "||" => Some(Value::Int(0)),
-                    "==" | "!=" => Value::equals(&lv, &rv).ok().map(|b| Value::Int(i32::from(b))),
+                    "==" | "!=" => Value::equals(&lv, &rv)
+                        .ok()
+                        .map(|b| Value::Int(i32::from(b))),
                     "<" | ">" | "<=" | ">=" => Value::compare(op, &lv, &rv)
                         .ok()
                         .map(|b| Value::Int(i32::from(b))),
@@ -1233,6 +1305,8 @@ impl<'a> Compiler<'a> {
     }
 
     fn static_number(&self, node: &Node) -> Option<Value> {
+        // Same shapes as `compile_number`, but as values instead of
+        // instructions: hex, float, or plain int.
         let t = self.text(node);
         if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
             return i32::from_str_radix(hex, 16).ok().map(Value::Int);
@@ -1286,6 +1360,8 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_number(&mut self, node: &Node<'a>) {
+        // Decimal, float, or hex: the grammar guarantees one of the
+        // three, so a parse failure here means a corrupt literal.
         let t = self.text(node);
         if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
             match i32::from_str_radix(hex, 16) {
@@ -1306,6 +1382,8 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_identifier(&mut self, node: &Node<'a>) {
+        // The four magic objects belong to the game. Everything else
+        // is a plain variable read.
         let name = self.text(node).to_string();
         match name.as_str() {
             "self" | "level" | "game" | "anim" => {
@@ -1324,6 +1402,8 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_binary(&mut self, node: &Node<'a>) {
+        // The operator is anonymous text between the operands, so fish
+        // it out of the source rather than the tree.
         let mut kids = self.named_children(node);
         if kids.len() != 2 {
             self.fail(node, "bad binary expression".to_string());
@@ -1332,7 +1412,9 @@ impl<'a> Compiler<'a> {
         let rhs = self.peel(kids.pop().unwrap());
         let lhs = self.peel(kids.pop().unwrap());
         // Operator text sits between the operands.
-        let op = self.src[lhs.end_byte()..rhs.start_byte()].trim().to_string();
+        let op = self.src[lhs.end_byte()..rhs.start_byte()]
+            .trim()
+            .to_string();
         self.check_binary(&lhs, &rhs, &op, node);
         match op.as_str() {
             "&&" => {
@@ -1395,32 +1477,24 @@ impl<'a> Compiler<'a> {
         let err = match op {
             "&&" => {
                 // The right side only runs when the left is true.
-                lv.truthy()
-                    .err()
-                    .or_else(|| {
-                        if lv.truthy().unwrap_or(false) {
-                            rv.truthy().err()
-                        } else {
-                            None
-                        }
-                    })
+                lv.truthy().err().or_else(|| {
+                    if lv.truthy().unwrap_or(false) {
+                        rv.truthy().err()
+                    } else {
+                        None
+                    }
+                })
             }
-            "||" => {
-                lv.truthy()
-                    .err()
-                    .or_else(|| {
-                        if !lv.truthy().unwrap_or(true) {
-                            rv.truthy().err()
-                        } else {
-                            None
-                        }
-                    })
-            }
+            "||" => lv.truthy().err().or_else(|| {
+                if !lv.truthy().unwrap_or(true) {
+                    rv.truthy().err()
+                } else {
+                    None
+                }
+            }),
             "==" | "!=" => Value::equals(&lv, &rv).err(),
             "<" | ">" | "<=" | ">=" => Value::compare(op, &lv, &rv).err(),
-            "+" | "-" | "*" | "/" | "%" => {
-                Value::arith(op.chars().next().unwrap(), &lv, &rv).err()
-            }
+            "+" | "-" | "*" | "/" | "%" => Value::arith(op.chars().next().unwrap(), &lv, &rv).err(),
             "<<" | ">>" | "|" | "^" | "&" => Self::check_int_only(&lv, &rv),
             _ => None,
         };
@@ -1453,31 +1527,39 @@ impl<'a> Compiler<'a> {
     /// Array indices must be integers; floats may truncate at runtime
     /// and are left alone, everything else is certainly wrong.
     fn check_index(&mut self, idx: &Node<'a>) {
-        if let Some(v) = self.static_value(idx) {
-            if !matches!(v, Value::Int(_) | Value::Float(_)) {
-                self.fail(idx, format!("array index must be an integer, got {}", v.type_name()));
-            }
+        if let Some(v) = self.static_value(idx)
+            && !matches!(v, Value::Int(_) | Value::Float(_))
+        {
+            self.fail(
+                idx,
+                format!("array index must be an integer, got {}", v.type_name()),
+            );
         }
     }
 
     fn compile_unary(&mut self, node: &Node<'a>) {
+        // Same trick: the sign lives between the node start and the
+        // operand.
         let mut kids = self.named_children(node);
         if kids.len() != 1 {
             self.fail(node, "bad unary expression".to_string());
             return;
         }
         let inner = self.peel(kids.pop().unwrap());
-        let op = self.src[node.start_byte()..inner.start_byte()].trim().to_string();
+        let op = self.src[node.start_byte()..inner.start_byte()]
+            .trim()
+            .to_string();
         if let Some(v) = self.static_value(&inner) {
             match op.as_str() {
                 "!" => self.check_truthy(&v, &inner),
                 "~" if !matches!(v, Value::Int(_)) => {
-                    self.fail(&inner, format!("~ cannot be applied to \"{}\"", v.type_name()));
+                    self.fail(
+                        &inner,
+                        format!("~ cannot be applied to \"{}\"", v.type_name()),
+                    );
                 }
-                "-" => {
-                    if Value::arith('-', &Value::Int(0), &v).is_err() {
-                        self.fail(&inner, format!("cannot negate {}", v.type_name()));
-                    }
+                "-" if Value::arith('-', &Value::Int(0), &v).is_err() => {
+                    self.fail(&inner, format!("cannot negate {}", v.type_name()));
                 }
                 _ => {}
             }
@@ -1504,6 +1586,8 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_postfix(&mut self, node: &Node<'a>) {
+        // `x++` yields the old value and stores the new one. Simple
+        // for locals, temps and address juggling for the rest.
         let mut kids = self.named_children(node);
         if kids.len() != 1 {
             self.fail(node, "bad postfix expression".to_string());
@@ -1544,6 +1628,8 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_assignment(&mut self, node: &Node<'a>) {
+        // Plain stores plus every compound form (`+=`, `<<=`, ...).
+        // The operator text sits between target and value.
         let var = node.child_by_field_name("variable");
         let val = node.child_by_field_name("assigned_value");
         let (Some(var), Some(val)) = (var, val) else {
@@ -1552,7 +1638,9 @@ impl<'a> Compiler<'a> {
         };
         let var = self.peel(var);
         let val = self.peel(val);
-        let op = self.src[var.end_byte()..val.start_byte()].trim().to_string();
+        let op = self.src[var.end_byte()..val.start_byte()]
+            .trim()
+            .to_string();
         if op == "=" {
             self.compile_assign_value(&var, &val, node);
             return;
@@ -1759,6 +1847,8 @@ fn has_thread_prefix(node: &Node) -> bool {
 
 impl<'a> Compiler<'a> {
     fn compile_call_args(&mut self, node: &Node<'a>) -> usize {
+        // Arguments evaluate left to right and stay on the stack; the
+        // count comes back so calls know exactly what to pop.
         for child in self.named_children(node) {
             if child.kind() == "argument_list" {
                 let mut n = 0;
@@ -1774,6 +1864,9 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_direct_call(&mut self, node: &Node<'a>) {
+        // Local functions call by name, builtins go through the
+        // builtin table, and anything else compiles anyway so
+        // cross-file code still checks.
         let threaded = node.kind() == "thread_call";
         // Callee: identifier or foreign_function_ptr.
         let mut callee = None;
@@ -1816,13 +1909,13 @@ impl<'a> Compiler<'a> {
             // resolved at runtime so the file still compiles standalone.
             // Arity is checked only when the engine provably enforces a
             // minimum; extra arguments are ignored by the engine.
-            if let Some(min) = builtin::arity(&name) {
-                if argc < min {
-                    self.fail(
-                        &callee,
-                        format!("{name} expects at least {min} parameters, got {argc}"),
-                    );
-                }
+            if let Some(min) = builtin::arity(&name)
+                && argc < min
+            {
+                self.fail(
+                    &callee,
+                    format!("{name} expects at least {min} parameters, got {argc}"),
+                );
             }
             // Declared parameter types are checked against statically
             // known arguments; anything relying on runtime is skipped.
@@ -1846,15 +1939,17 @@ impl<'a> Compiler<'a> {
             }
         }
         for (param, arg) in params.iter().zip(args.iter()) {
-            if let Some(v) = self.static_value(arg) {
-                if let Some(message) = arg_mismatch(&param.ptype, &v, fname, &param.name) {
-                    self.fail(arg, message);
-                }
+            if let Some(v) = self.static_value(arg)
+                && let Some(message) = arg_mismatch(&param.ptype, &v, fname, &param.name)
+            {
+                self.fail(arg, message);
             }
         }
     }
 
     fn compile_object_call(&mut self, node: &Node<'a>) {
+        // `obj meth(args)`: engine builtins need a game, anything else
+        // calls the local function with the object as `self`.
         // The grammar orders children as object, optional `thread`,
         // then the method reference: take them positionally so array
         // and member objects (`a[0] foo()`) work too.
@@ -1922,7 +2017,9 @@ impl<'a> Compiler<'a> {
         if is_builtin_method(&method_name) {
             self.emit(
                 Op::NeedGame,
-                Operand::Name(format!("builtin method {method_name} needs a game attached")),
+                Operand::Name(format!(
+                    "builtin method {method_name} needs a game attached"
+                )),
                 node,
             );
             self.emit_simple(Op::GetUndefined, node);
@@ -1932,18 +2029,24 @@ impl<'a> Compiler<'a> {
         let obj = self.peel(obj);
         self.compile_expr(&obj);
         let argc = self.compile_call_args(node);
-        self.emit(Op::CallMethod, Operand::FuncCall { name: method_name, argc }, node);
+        self.emit(
+            Op::CallMethod,
+            Operand::FuncCall {
+                name: method_name,
+                argc,
+            },
+            node,
+        );
     }
 
     fn compile_pointer_call(&mut self, node: &Node<'a>) {
+        // `[[expr]](args)`: the reference hides below the arguments on
+        // the stack, exactly where `CallPointer` pops it from.
         let mut target = None;
         for child in self.named_children(node) {
-            match child.kind() {
-                "stored_func_ref" => {
-                    target = Some(child);
-                    break;
-                }
-                _ => {}
+            if child.kind() == "stored_func_ref" {
+                target = Some(child);
+                break;
             }
         }
         let Some(target) = target else {
@@ -1965,10 +2068,13 @@ impl<'a> Compiler<'a> {
         let mut done = false;
         for child in self.named_children(&target) {
             let e = self.peel(child);
-            if let Some(v) = self.static_value(&e) {
-                if !matches!(v, Value::Func(_)) {
-                    self.fail(&e, format!("[[...]] needs a function, got {}", v.type_name()));
-                }
+            if let Some(v) = self.static_value(&e)
+                && !matches!(v, Value::Func(_))
+            {
+                self.fail(
+                    &e,
+                    format!("[[...]] needs a function, got {}", v.type_name()),
+                );
             }
             if e.kind() == "identifier" {
                 self.compile_identifier(&e);
@@ -1995,6 +2101,8 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_member_read(&mut self, node: &Node<'a>) {
+        // `a.b`: struct fields read straight through; game objects
+        // bail to the game boundary instead.
         let Some((base, field)) = self.split_member(node) else {
             self.fail(node, "bad member access".to_string());
             self.emit_simple(Op::GetUndefined, node);
@@ -2017,6 +2125,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_array_read(&mut self, node: &Node<'a>) {
+        // `a[i][j]`: each index applies in turn, left to right.
         let mut kids = self.named_children(node);
         if kids.is_empty() {
             self.fail(node, "bad array access".to_string());

@@ -22,7 +22,8 @@ pub(crate) enum BuiltinError {
     Game(String),
 }
 
-/// Deterministic xorshift64 seed holder for `random*`.
+/// Deterministic xorshift64 seed holder for `random*`. Same seed in,
+/// same sequence out, which keeps tests honest.
 pub(crate) struct Rng(pub u64);
 
 impl Rng {
@@ -37,22 +38,26 @@ impl Rng {
 }
 
 fn deg2rad(d: f32) -> f32 {
+    // Script angles are degrees everywhere; the engine converts with
+    // pi/180 at the boundary, so this does too.
     d * std::f32::consts::PI / 180.0
 }
 
 fn rad2deg(r: f32) -> f32 {
+    // Inverse trig answers come back in degrees too, matching the way in.
     r * 180.0 / std::f32::consts::PI
 }
 
 fn num(n: &Value) -> Result<f32, BuiltinError> {
+    // Numeric builtin parameter: ints and floats pass, numeric
+    // strings coerce, anything else is a script error.
     match n {
         Value::Int(i) => Ok(*i as f32),
         Value::Float(f) => Ok(*f),
         // The engine reads numbers with `CastFloat`, which takes
         // numeric strings too.
-        Value::Str(s) => super::value::atof(s).ok_or_else(|| {
-            BuiltinError::Script(format!("expected number, got {}", n.type_name()))
-        }),
+        Value::Str(s) => super::value::atof(s)
+            .ok_or_else(|| BuiltinError::Script(format!("expected number, got {}", n.type_name()))),
         v => Err(BuiltinError::Script(format!(
             "expected number, got {}",
             v.type_name()
@@ -61,6 +66,8 @@ fn num(n: &Value) -> Result<f32, BuiltinError> {
 }
 
 fn vec(n: &Value) -> Result<[f32; 3], BuiltinError> {
+    // Vector builtin parameter: vectors only, no coercion, exactly
+    // like the engine's vector reads.
     match n {
         Value::Vec3(v) => Ok(*v),
         v => Err(BuiltinError::Script(format!(
@@ -71,6 +78,8 @@ fn vec(n: &Value) -> Result<[f32; 3], BuiltinError> {
 }
 
 fn expect(args: &[Value], n: usize, name: &str) -> Result<(), BuiltinError> {
+    // Minimum count only: extra arguments sit unread on the stack in
+    // the engine, so only too few is an error.
     // The engine passes all written arguments and only reads what it
     // needs, so extras are ignored; too few is a script error.
     if args.len() < n {
@@ -143,11 +152,33 @@ pub(crate) fn arity(name: &str) -> Option<usize> {
 pub(crate) fn is_pure(name: &str) -> bool {
     matches!(
         name,
-        "isdefined" | "assert" | "print" | "logprint" | "println" | "sin" | "cos" | "tan"
-            | "asin" | "acos" | "atan" | "distance" | "distancesquared" | "length"
-            | "lengthsquared" | "vectordot" | "vectornormalize" | "vectortoangles"
-            | "anglestoforward" | "anglestoright" | "anglestoup" | "closer" | "randomint"
-            | "randomintrange" | "randomfloat" | "randomfloatrange" | "spawnstruct"
+        "isdefined"
+            | "assert"
+            | "print"
+            | "logprint"
+            | "println"
+            | "sin"
+            | "cos"
+            | "tan"
+            | "asin"
+            | "acos"
+            | "atan"
+            | "distance"
+            | "distancesquared"
+            | "length"
+            | "lengthsquared"
+            | "vectordot"
+            | "vectornormalize"
+            | "vectortoangles"
+            | "anglestoforward"
+            | "anglestoright"
+            | "anglestoup"
+            | "closer"
+            | "randomint"
+            | "randomintrange"
+            | "randomfloat"
+            | "randomfloatrange"
+            | "spawnstruct"
     )
 }
 
@@ -220,7 +251,9 @@ pub(crate) fn call(
         "length" => {
             expect(args, 1, name)?;
             let v = vec(&args[0])?;
-            Ok(Value::Float((v[0].powi(2) + v[1].powi(2) + v[2].powi(2)).sqrt()))
+            Ok(Value::Float(
+                (v[0].powi(2) + v[1].powi(2) + v[2].powi(2)).sqrt(),
+            ))
         }
         "lengthsquared" => {
             expect(args, 1, name)?;
@@ -235,7 +268,9 @@ pub(crate) fn call(
         "vectornormalize" => {
             expect(args, 1, name)?;
             let v = vec(&args[0])?;
-            let len = (v[0].powi(2) + v[1].powi(2) + v[2].powi(2)).sqrt().max(f32::EPSILON);
+            let len = (v[0].powi(2) + v[1].powi(2) + v[2].powi(2))
+                .sqrt()
+                .max(f32::EPSILON);
             Ok(Value::Vec3([v[0] / len, v[1] / len, v[2] / len]))
         }
         "vectortoangles" => {
@@ -287,7 +322,9 @@ pub(crate) fn call(
             if hi <= lo {
                 return Err(Script("randomintrange needs lo < hi".to_string()));
             }
-            Ok(Value::Int(lo + (rng.next_u32() % ((hi - lo) as u32)) as i32))
+            Ok(Value::Int(
+                lo + (rng.next_u32() % ((hi - lo) as u32)) as i32,
+            ))
         }
         "randomfloat" => {
             expect(args, 1, name)?;
@@ -297,7 +334,9 @@ pub(crate) fn call(
         "randomfloatrange" => {
             expect(args, 2, name)?;
             let (lo, hi) = (num(&args[0])?, num(&args[1])?);
-            Ok(Value::Float(lo + (hi - lo) * (rng.next_u32() as f32 / u32::MAX as f32)))
+            Ok(Value::Float(
+                lo + (hi - lo) * (rng.next_u32() as f32 / u32::MAX as f32),
+            ))
         }
         // A struct is just a field bag; no game state involved.
         "spawnstruct" => {
@@ -346,7 +385,9 @@ mod tests {
     fn game_builtins_report_game() {
         assert_eq!(
             run("getent", vec![Value::Str("x".into())]),
-            Err(BuiltinError::Game("getent needs a game attached".to_string()))
+            Err(BuiltinError::Game(
+                "getent needs a game attached".to_string()
+            ))
         );
     }
 

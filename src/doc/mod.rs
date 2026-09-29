@@ -2,15 +2,15 @@
 static BUILTINS: &str = include_str!("../assets/builtins.ron");
 
 use serde::{Deserialize, Serialize};
-use tower_lsp_server::lsp_types::Hover;
 use std::collections::HashMap;
 use std::fs;
+use tower_lsp_server::lsp_types::Hover;
 
 use crate::backend::Backend;
 use crate::util;
 
-pub(crate) mod strings;
 pub(crate) mod serde_helper;
+pub(crate) mod strings;
 use serde_helper::deserialize_lower_map;
 
 /// A builtin script function or method
@@ -46,77 +46,55 @@ pub(crate) struct ScrMethod {
 }
 
 impl ScriptCallable for ScrFunction {
-    fn kind(&self) -> String
-    {
+    fn kind(&self) -> String {
         "Builtin Function".to_string()
     }
-    fn camel_name(&self) -> Option<String>
-    {
-        match &self.camel_name {
-            Some(cn) => Some(cn.clone()),
-            None => None
-        }
+    fn camel_name(&self) -> Option<String> {
+        self.camel_name.clone()
     }
-    fn sign(&self) -> String
-    {
+    fn sign(&self) -> String {
         self.sign.clone()
     }
-    fn info(&self) -> String
-    {
+    fn info(&self) -> String {
         self.info.clone()
     }
-    fn called_on(&self) -> String
-    {
+    fn called_on(&self) -> String {
         "".to_string()
     }
-    fn param_names(&self) -> Vec<String>
-    {
+    fn param_names(&self) -> Vec<String> {
         self.params.iter().map(|p| p.name.clone()).collect()
     }
-    fn example(&self) -> String
-    {
+    fn example(&self) -> String {
         if let Some(ref ex) = self.example {
             ex.clone()
-        }
-        else {
+        } else {
             "No example, consider contributing!".to_string()
         }
     }
 }
 impl ScriptCallable for ScrMethod {
-    fn kind(&self) -> String
-    {
+    fn kind(&self) -> String {
         "Builtin Method".to_string()
     }
-    fn camel_name(&self) -> Option<String>
-    {
-        match &self.camel_name {
-            Some(cn) => Some(cn.clone()),
-            None => None
-        }
+    fn camel_name(&self) -> Option<String> {
+        self.camel_name.clone()
     }
-    fn sign(&self) -> String
-    {
+    fn sign(&self) -> String {
         self.sign.clone()
     }
-    fn info(&self) -> String
-    {
+    fn info(&self) -> String {
         self.info.clone()
     }
-    fn called_on(&self) -> String
-    {
+    fn called_on(&self) -> String {
         self.called_on.clone()
     }
-    fn param_names(&self) -> Vec<String>
-    {
+    fn param_names(&self) -> Vec<String> {
         self.params.iter().map(|p| p.name.clone()).collect()
     }
-    fn example(&self) -> String
-    {
+    fn example(&self) -> String {
         if let Some(ref ex) = self.example {
             ex.clone()
-        }
-        else {
+        } else {
             "No example, consider contributing!".to_string()
         }
     }
@@ -155,15 +133,19 @@ pub(crate) struct Builtins {
 }
 
 impl Builtins {
-    pub(crate) fn new() -> Self
-    {
-        Self { functions: HashMap::new(), methods: HashMap::new() }
+    /// Empty docs: what the server holds before `load_docs` fills it.
+    pub(crate) fn new() -> Self {
+        Self {
+            functions: HashMap::new(),
+            methods: HashMap::new(),
+        }
     }
 }
 
 impl Backend {
-    pub(crate) fn unpack_docs(&self)
-    {
+    /// Unpack the embedded docs where the server expects them.
+    /// Always overwrites: the copy belongs to the binary version.
+    pub(crate) fn unpack_docs(&self) {
         let data_dir = util::get_data_dir().unwrap();
         let docs_dir = data_dir.join("docs");
         let fns_file = docs_dir.join("builtins.ron");
@@ -178,39 +160,46 @@ impl Backend {
         let _ = fs::remove_file(docs_dir.join("brenz-builtins-schema.json"));
     }
 
-    pub(crate) async fn load_docs(&self)
-    {
+    /// Load the unpacked docs into memory, falling back to the
+    /// embedded copy when the file went missing or broke.
+    pub(crate) async fn load_docs(&self) {
         let data_dir = util::get_data_dir().unwrap();
         let docs_dir = data_dir.join("docs");
         let fns_file = docs_dir.join("builtins.ron");
 
-        let content = tokio::fs::read_to_string(&fns_file).await.unwrap_or_else(|_| BUILTINS.to_string());
+        let content = tokio::fs::read_to_string(&fns_file)
+            .await
+            .unwrap_or_else(|_| BUILTINS.to_string());
         let builtins: Builtins = ron::from_str(&content).unwrap_or_else(|e| {
-            util::logprint!(util::LogType::Error, "Couldn't parse builtin functions file, using embedded docs: {e}");
+            util::logprint!(
+                util::LogType::Error,
+                "Couldn't parse builtin functions file, using embedded docs: {e}"
+            );
             ron::from_str(BUILTINS).expect("embedded builtins.ron")
         });
 
         *self.builtins_doc.lock().await = builtins;
     }
 
-    fn identifier_hover_info_get_hover(&self, info: String) -> Option<Hover>
-    {
+    /// Tiny wrapper turning info text into a hover response.
+    fn identifier_hover_info_get_hover(&self, info: String) -> Option<Hover> {
         use crate::{HoverContents, MarkedString};
         Some(Hover {
             contents: HoverContents::Scalar(MarkedString::String(info)),
-            range: None
+            range: None,
         })
     }
 
-    pub(crate) fn identifier_hover_info(&self, identifier: &str) -> Option<Hover>
-    {
+    /// One-liners for the magic words (`self`, `level`, `wait`
+    /// ...). Everything else resolves through the builtin tables.
+    pub(crate) fn identifier_hover_info(&self, identifier: &str) -> Option<Hover> {
         let txt = match identifier {
             "wait" => strings::WAIT_INFO.to_string(),
             "thread" => strings::THREAD_INFO.to_string(),
             "self" => strings::SELF_INFO.to_string(),
             "level" => strings::LEVEL_INFO.to_string(),
             "game" => strings::GAME_INFO.to_string(),
-            _ => String::new()
+            _ => String::new(),
         };
         if txt.is_empty() {
             return None;
@@ -230,7 +219,13 @@ mod tests {
         // coduomp: 120 script functions, 172 script methods (plus aliases).
         assert!(b.functions.len() >= 120, "functions: {}", b.functions.len());
         assert!(b.methods.len() >= 172, "methods: {}", b.methods.len());
-        for key in ["spawn", "getent", "isdefined", "objective_add", "precachemodel"] {
+        for key in [
+            "spawn",
+            "getent",
+            "isdefined",
+            "objective_add",
+            "precachemodel",
+        ] {
             assert!(b.functions.contains_key(key), "missing function {key}");
         }
         for key in ["settext", "dodamage", "getstance", "fireturret", "suicide"] {
@@ -238,4 +233,3 @@ mod tests {
         }
     }
 }
-

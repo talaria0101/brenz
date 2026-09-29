@@ -1,17 +1,19 @@
 //! Parsing related methods for Backend
 
-use crate::util::{LogType, logprint};
 use crate::compiler::compile::compile as compile_gsc;
+use crate::util::{LogType, logprint};
 
-use tower_lsp_server as tower_lsp;
 use super::Backend;
-use tower_lsp::lsp_types::*;
-use tree_sitter::Tree;
 use std::collections::HashMap;
+use tower_lsp::lsp_types::*;
+use tower_lsp_server as tower_lsp;
+use tree_sitter::Tree;
 
 impl Backend {
-    pub async fn parse_and_diagnose(&self, uri: Uri, text: &str)
-    {
+    /// The whole pipeline for one document version: brackets, parse,
+    /// symbols, compile checks, project checks, then publish. Runs on
+    /// open and (debounced) on every edit.
+    pub async fn parse_and_diagnose(&self, uri: Uri, text: &str) {
         let checker = self.checker.clone();
         let parser = self.parser.clone();
         let trees = self.trees.clone();
@@ -28,15 +30,20 @@ impl Backend {
                 .collect();
 
             for (i, diag) in diagnostics.iter().enumerate() {
-                client.log_message(
-                    MessageType::INFO,
-                    format!("Bracket or Quote Error {}: {}:{}-{}:{} | {}",
-                        i,
-                        diag.range.start.line, diag.range.start.character,
-                        diag.range.end.line, diag.range.end.character,
-                        diag.message
+                client
+                    .log_message(
+                        MessageType::INFO,
+                        format!(
+                            "Bracket or Quote Error {}: {}:{}-{}:{} | {}",
+                            i,
+                            diag.range.start.line,
+                            diag.range.start.character,
+                            diag.range.end.line,
+                            diag.range.end.character,
+                            diag.message
+                        ),
                     )
-                ).await;
+                    .await;
             }
 
             client.publish_diagnostics(uri, diagnostics, None).await;
@@ -46,7 +53,7 @@ impl Backend {
         // Parse in a narrow scope: the project-aware checks below
         // re-lock the parser for on-demand files, and holding this
         // guard across them deadlocks the task on itself.
-        let tree = parser.lock().await.parse(&text, None);
+        let tree = parser.lock().await.parse(text, None);
         match tree {
             Some(tree) => {
                 {
@@ -56,21 +63,26 @@ impl Backend {
 
                     if !diagnostics.is_empty() {
                         for (i, diag) in diagnostics.iter_mut().enumerate() {
-                            client.log_message(
-                                MessageType::INFO,
-                                format!("Diagnostic {}: {}:{}-{}:{} | {}",
-                                    i,
-                                    diag.range.start.line, diag.range.start.character,
-                                    diag.range.end.line, diag.range.end.character,
-                                    diag.message
+                            client
+                                .log_message(
+                                    MessageType::INFO,
+                                    format!(
+                                        "Diagnostic {}: {}:{}-{}:{} | {}",
+                                        i,
+                                        diag.range.start.line,
+                                        diag.range.start.character,
+                                        diag.range.end.line,
+                                        diag.range.end.character,
+                                        diag.message
+                                    ),
                                 )
-                            ).await;
+                                .await;
                             if &diag.message == "Expected ;" {
-                                diag.message = "Perhaps you forgot a semi-colon (;) here?".to_string();
+                                diag.message =
+                                    "Perhaps you forgot a semi-colon (;) here?".to_string();
                             }
                         }
-                    }
-                    else {
+                    } else {
                         let fns = Self::extract_fns(&tree, text);
                         fn_defs.lock().await.insert(uri.clone(), fns);
                         let syms = Self::extract_syms(&tree, text);
@@ -90,8 +102,14 @@ impl Backend {
             None => {
                 let diagnostic = Diagnostic {
                     range: Range {
-                        start: Position { line: 0, character: 0 },
-                        end: Position { line: 0, character: text.chars().count() as u32 },
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: text.chars().count() as u32,
+                        },
                     },
                     severity: Some(DiagnosticSeverity::ERROR),
                     code: None,
@@ -103,13 +121,15 @@ impl Backend {
                     data: None,
                 };
 
-                client.publish_diagnostics(uri, vec![diagnostic], None).await;
+                client
+                    .publish_diagnostics(uri, vec![diagnostic], None)
+                    .await;
             }
         }
     }
 
-    fn collect_diagnostics(tree: &Tree, source: &str) -> Vec<Diagnostic>
-    {
+    fn collect_diagnostics(tree: &Tree, source: &str) -> Vec<Diagnostic> {
+        // Walk the whole tree gathering parse-error nodes.
         let mut diagnostics = Vec::new();
 
         Self::find_errors(&tree.root_node(), source, &mut diagnostics);
@@ -117,8 +137,9 @@ impl Backend {
         diagnostics
     }
 
-    fn find_errors(node: &tree_sitter::Node, source: &str, diagnostics: &mut Vec<Diagnostic>)
-    {
+    fn find_errors(node: &tree_sitter::Node, source: &str, diagnostics: &mut Vec<Diagnostic>) {
+        // Recursive sweep: `ERROR` nodes become diagnostics, missing
+        // nodes (half-typed syntax) become "expected X" hints.
         if node.kind() == "ERROR" {
             let start_pos = Self::byte_to_position(source, node.start_byte());
             let mut end_pos = Self::byte_to_position(source, node.end_byte());
@@ -129,12 +150,14 @@ impl Backend {
             }
 
             // Handle EOL cases where Kate might not show underlines
-            let (adjusted_start, adjusted_end) = Self::adjust_range_for_visibility(
-                source, start_pos, end_pos
-            );
+            let (adjusted_start, adjusted_end) =
+                Self::adjust_range_for_visibility(source, start_pos, end_pos);
 
             let error_text = &source[node.start_byte()..node.end_byte()];
-            let clean_text = error_text.replace(['\n', '\r', '\t'], " ").trim().to_string();
+            let clean_text = error_text
+                .replace(['\n', '\r', '\t'], " ")
+                .trim()
+                .to_string();
 
             let diagnostic = Diagnostic {
                 range: Range {
@@ -161,44 +184,43 @@ impl Backend {
         // Check if node has missing children (incomplete parse)
         if node.has_error() && node.kind() != "ERROR" {
             for i in 0..node.child_count() {
-                if let Some(child) = node.child(i.try_into().unwrap()) {
-                    if child.is_missing() {
-                        let start_pos = Self::byte_to_position(source, child.start_byte());
-                        let mut end_pos = Self::byte_to_position(source, child.end_byte());
+                if let Some(child) = node.child(i)
+                    && child.is_missing()
+                {
+                    let start_pos = Self::byte_to_position(source, child.start_byte());
+                    let mut end_pos = Self::byte_to_position(source, child.end_byte());
 
-                        // For missing nodes, create a small range at the expected position
-                        if start_pos == end_pos {
-                            end_pos.character += 1;
-                        }
-
-                        let (adjusted_start, adjusted_end) = Self::adjust_range_for_visibility(
-                            source, start_pos, end_pos
-                        );
-
-                        let diagnostic = Diagnostic {
-                            range: Range {
-                                start: adjusted_start,
-                                end: adjusted_end,
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            code: Some(NumberOrString::String("missing-syntax".to_string())),
-                            source: Some("gsc-parser".to_string()),
-                            message: format!("Expected {}", child.kind()),
-                            related_information: None,
-                            tags: None,
-                            code_description: None,
-                            data: None,
-                        };
-
-                        diagnostics.push(diagnostic);
+                    // For missing nodes, create a small range at the expected position
+                    if start_pos == end_pos {
+                        end_pos.character += 1;
                     }
+
+                    let (adjusted_start, adjusted_end) =
+                        Self::adjust_range_for_visibility(source, start_pos, end_pos);
+
+                    let diagnostic = Diagnostic {
+                        range: Range {
+                            start: adjusted_start,
+                            end: adjusted_end,
+                        },
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        code: Some(NumberOrString::String("missing-syntax".to_string())),
+                        source: Some("gsc-parser".to_string()),
+                        message: format!("Expected {}", child.kind()),
+                        related_information: None,
+                        tags: None,
+                        code_description: None,
+                        data: None,
+                    };
+
+                    diagnostics.push(diagnostic);
                 }
             }
         }
 
         // Check children for errors
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i.try_into().unwrap()) {
+            if let Some(child) = node.child(i) {
                 Self::find_errors(&child, source, diagnostics);
             }
         }
@@ -206,8 +228,11 @@ impl Backend {
 
     /// Some editors (including kate) might not show a red underline at EOL.
     /// So, we need to adjust the char range to underline.
-    fn adjust_range_for_visibility(source: &str, start: Position, end: Position) -> (Position, Position)
-    {
+    fn adjust_range_for_visibility(
+        source: &str,
+        start: Position,
+        end: Position,
+    ) -> (Position, Position) {
         let lines: Vec<&str> = source.lines().collect();
 
         // If we're beyond the available lines, return as-is
@@ -233,10 +258,13 @@ impl Backend {
                 return (new_start, new_end);
             } else {
                 // Empty line, can't adjust much, but ensure we have a minimal range
-                return (start, Position {
-                    line: start.line,
-                    character: start.character + 1,
-                });
+                return (
+                    start,
+                    Position {
+                        line: start.line,
+                        character: start.character + 1,
+                    },
+                );
             }
         }
 
@@ -255,11 +283,8 @@ impl Backend {
     /// under `uri` without publishing diagnostics. Used for scripts that
     /// were not opened by the client: workspace files read from disk and
     /// scripts loaded from `.pk3` archives.
-    pub(crate) async fn parse_and_store(&self, uri: Uri, text: &str) -> bool
-    {
-        let tree = {
-            self.parser.lock().await.parse(text, None)
-        };
+    pub(crate) async fn parse_and_store(&self, uri: Uri, text: &str) -> bool {
+        let tree = { self.parser.lock().await.parse(text, None) };
         let Some(tree) = tree else {
             return false;
         };
@@ -273,48 +298,51 @@ impl Backend {
     }
 
     /// Get function definitions from parsed trees
-    pub(crate) fn extract_fns(tree: &Tree, source: &str) -> HashMap<String, (Range, Option<String>)>
-    {
-        let mut fns: HashMap<String, (Range, Option<String>)> = HashMap::new();
+    pub(crate) fn extract_fns(tree: &Tree, source: &str) -> super::FnDefs {
+        let mut fns: super::FnDefs = HashMap::new();
         let root = tree.root_node();
         let mut cursor = root.walk();
 
         for child in root.children(&mut cursor) {
             // First child should be function name identifier
-            if let Some(func_head) = child.child_by_field_name("func_head") {
-                if let Some(name_node) = func_head.child(0) {
-                    if name_node.kind() == "identifier" {
-                        let name = &source[name_node.start_byte()..name_node.end_byte()];
-                        let range = Range {
-                            start: Self::byte_to_position(source, func_head.start_byte()),
-                            end: Self::byte_to_position(source, func_head.end_byte()),
-                        };
+            if let Some(func_head) = child.child_by_field_name("func_head")
+                && let Some(name_node) = func_head.child(0)
+                && name_node.kind() == "identifier"
+            {
+                let name = &source[name_node.start_byte()..name_node.end_byte()];
+                let range = Range {
+                    start: Self::byte_to_position(source, func_head.start_byte()),
+                    end: Self::byte_to_position(source, func_head.end_byte()),
+                };
 
-                        let comment = match child.prev_sibling() {
-                            Some(ps) => {
-                                if ps.kind() == "comment" {
-                                    Some(source[ps.start_byte()..ps.end_byte()].to_string())
-                                }
-                                else { None }
-                            }
-                            None => None
-                        };
-
-                        logprint!(
-                            LogType::Info, "Name: {}, Function: {}, Comment: {:?}",
-                            name, &source[func_head.start_byte()..func_head.end_byte()], &comment.as_ref()
-                        );
-
-                        fns.insert(name.to_string(), (range, comment));
+                let comment = match child.prev_sibling() {
+                    Some(ps) => {
+                        if ps.kind() == "comment" {
+                            Some(source[ps.start_byte()..ps.end_byte()].to_string())
+                        } else {
+                            None
+                        }
                     }
-                }
+                    None => None,
+                };
+
+                logprint!(
+                    LogType::Info,
+                    "Name: {}, Function: {}, Comment: {:?}",
+                    name,
+                    &source[func_head.start_byte()..func_head.end_byte()],
+                    &comment.as_ref()
+                );
+
+                fns.insert(name.to_string(), (range, comment));
             }
         }
         fns
     }
 
-    pub(crate) fn extract_syms(tree: &Tree, src: &str) -> Vec<DocumentSymbol>
-    {
+    pub(crate) fn extract_syms(tree: &Tree, src: &str) -> Vec<DocumentSymbol> {
+        // Function symbols with their local variables nested inside,
+        // feeding both the symbol tree and completion.
         let mut symbols: Vec<DocumentSymbol> = Vec::new();
         let root = tree.root_node();
         let mut cursor = root.walk();
@@ -326,7 +354,11 @@ impl Backend {
                 if let Some(func_block) = child.child_by_field_name("func_block") {
                     logprint!(LogType::Info, "in func_block");
                     let mut assign_exprs = Vec::new();
-                    Self::find_descendants_of_kind(func_block, "assignment_expression", &mut assign_exprs);
+                    Self::find_descendants_of_kind(
+                        func_block,
+                        "assignment_expression",
+                        &mut assign_exprs,
+                    );
                     logprint!(LogType::Info, "assign_exprs: {:#?}", assign_exprs.clone());
                     let mut done: Vec<String> = Vec::new();
 
@@ -346,14 +378,14 @@ impl Backend {
                                 #[allow(deprecated)]
                                 deprecated: None,
                                 range: Range {
-                                    start: Self::byte_to_position(&src, expr.start_byte()),
-                                    end: Self::byte_to_position(&src, expr.end_byte()),
+                                    start: Self::byte_to_position(src, expr.start_byte()),
+                                    end: Self::byte_to_position(src, expr.end_byte()),
                                 },
-                                selection_range:Range {
-                                    start: Self::byte_to_position(&src, var.start_byte()),
-                                    end: Self::byte_to_position(&src, var.end_byte()),
+                                selection_range: Range {
+                                    start: Self::byte_to_position(src, var.start_byte()),
+                                    end: Self::byte_to_position(src, var.end_byte()),
                                 },
-                                children: None
+                                children: None,
                             };
 
                             //logprint!(LogType::Info, "Symbol: {:#?}", sym.clone());
@@ -365,29 +397,29 @@ impl Backend {
                     }
                 }
 
-                if let Some(func_head) = child.child_by_field_name("func_head") {
-                    if let Some(name_node) = func_head.child(0) {
-                        let name = &src[name_node.start_byte()..name_node.end_byte()];
-                        let detail = &src[func_head.start_byte()..func_head.end_byte()];
+                if let Some(func_head) = child.child_by_field_name("func_head")
+                    && let Some(name_node) = func_head.child(0)
+                {
+                    let name = &src[name_node.start_byte()..name_node.end_byte()];
+                    let detail = &src[func_head.start_byte()..func_head.end_byte()];
 
-                        symbols.push(DocumentSymbol {
-                            name: name.to_lowercase(),
-                            detail: Some(detail.to_string()),
-                            kind: SymbolKind::FUNCTION,
-                            tags: None,
-                            #[allow(deprecated)]
-                            deprecated: None, // screw it
-                            range: Range {
-                                start: Self::byte_to_position(&src, child.start_byte()),
-                                end: Self::byte_to_position(&src, child.end_byte()),
-                            },
-                            selection_range: Range {
-                                start: Self::byte_to_position(&src, func_head.start_byte()),
-                                end: Self::byte_to_position(&src, func_head.end_byte()),
-                            },
-                            children: Some(vars),
-                        });
-                    }
+                    symbols.push(DocumentSymbol {
+                        name: name.to_lowercase(),
+                        detail: Some(detail.to_string()),
+                        kind: SymbolKind::FUNCTION,
+                        tags: None,
+                        #[allow(deprecated)]
+                        deprecated: None, // screw it
+                        range: Range {
+                            start: Self::byte_to_position(src, child.start_byte()),
+                            end: Self::byte_to_position(src, child.end_byte()),
+                        },
+                        selection_range: Range {
+                            start: Self::byte_to_position(src, func_head.start_byte()),
+                            end: Self::byte_to_position(src, func_head.end_byte()),
+                        },
+                        children: Some(vars),
+                    });
                 }
             }
         }

@@ -61,11 +61,7 @@ impl BrenzConfig {
             Ok(c) => c,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Self::default(),
             Err(e) => {
-                logprint!(
-                    LogType::Error,
-                    "Couldn't read {}: {e}",
-                    path.display()
-                );
+                logprint!(LogType::Error, "Couldn't read {}: {e}", path.display());
                 return Self::default();
             }
         };
@@ -79,18 +75,15 @@ impl BrenzConfig {
                         path.display()
                     );
                 } else {
-                    logprint!(
-                        LogType::Error,
-                        "Couldn't parse {}: {e}",
-                        path.display()
-                    );
+                    logprint!(LogType::Error, "Couldn't parse {}: {e}", path.display());
                 }
                 Self::default()
             }
         }
     }
 
-    /// Write a fresh `.brenz` file into `dir`.
+    /// Write a fresh `.brenz` file into `dir`. Refuses when one
+    /// already exists rather than clobbering someone's config.
     pub(crate) fn init_in(dir: &Path) -> io::Result<PathBuf> {
         let f = dir.join(CONFIG_FILE_NAME);
         if f.exists() {
@@ -116,21 +109,16 @@ mod tests {
 
     #[test]
     fn parses_game_paths() {
-        let cfg: BrenzConfig =
-            ron::from_str("(game_paths: [\"/games/cod\", \"C:/CoD\"])").unwrap();
+        let cfg: BrenzConfig = ron::from_str("(game_paths: [\"/games/cod\", \"C:/CoD\"])").unwrap();
         assert_eq!(
             cfg.game_paths,
-            vec![
-                PathBuf::from("/games/cod"),
-                PathBuf::from("C:/CoD")
-            ]
+            vec![PathBuf::from("/games/cod"), PathBuf::from("C:/CoD")]
         );
     }
 
     #[test]
     fn ignores_unknown_fields() {
-        let cfg: BrenzConfig =
-            ron::from_str("(game_paths: [], future_option: 42)").unwrap();
+        let cfg: BrenzConfig = ron::from_str("(game_paths: [], future_option: 42)").unwrap();
         assert!(cfg.game_paths.is_empty());
     }
 

@@ -1,5 +1,6 @@
-
-use tower_lsp_server::lsp_types::{CompletionItem, CompletionItemKind, Documentation, MarkupContent, MarkupKind, Position};
+use tower_lsp_server::lsp_types::{
+    CompletionItem, CompletionItemKind, Documentation, MarkupContent, MarkupKind, Position,
+};
 use tree_sitter::Tree;
 
 use crate::{backend::Backend, doc::GscType};
@@ -10,45 +11,57 @@ enum CompletionContext {
     StructMemberAccess { struct_name: String },
     VariableAssignment,
     FunctionDefinition,
-    Unknown
+    Unknown,
 }
 
 impl Backend {
-    fn detect_completion_context(&self, tree: &Tree, source: &str, pos: Position) -> CompletionContext
-    {
+    fn detect_completion_context(
+        &self,
+        tree: &Tree,
+        source: &str,
+        pos: Position,
+    ) -> CompletionContext {
         let node = match self.node_at_pos(tree, source, pos) {
             Some(n) => n,
-            None => return CompletionContext::GlobalScope
+            None => return CompletionContext::GlobalScope,
         };
 
-        if let Some(dot_node) = self.find_parent_of_kind(node, ".") {
-            if let Some(left_sib) = dot_node.prev_sibling() {
-                let struct_name = &source[left_sib.start_byte()..left_sib.end_byte()];
-                return CompletionContext::StructMemberAccess { struct_name: struct_name.to_string() };
-            }
+        if let Some(dot_node) = self.find_parent_of_kind(node, ".")
+            && let Some(left_sib) = dot_node.prev_sibling()
+        {
+            let struct_name = &source[left_sib.start_byte()..left_sib.end_byte()];
+            return CompletionContext::StructMemberAccess {
+                struct_name: struct_name.to_string(),
+            };
         }
 
-        if let Some(call_node) = self.find_parent_of_kind(node, "direct_call")
+        if let Some(call_node) = self
+            .find_parent_of_kind(node, "direct_call")
             .or_else(|| self.find_parent_of_kind(node, "thread_call"))
             .or_else(|| self.find_parent_of_kind(node, "object_call"))
+            && let Some(func_name_node) = call_node.child_by_field_name("function")
         {
-            if let Some(func_name_node) = call_node.child_by_field_name("function") {
-                let function_name = &source[func_name_node.start_byte()..func_name_node.end_byte()];
-                return CompletionContext::FunctionCall {
-                    function_name: function_name.to_string()
-                };
-            }
+            let function_name = &source[func_name_node.start_byte()..func_name_node.end_byte()];
+            return CompletionContext::FunctionCall {
+                function_name: function_name.to_string(),
+            };
         }
 
-        if self.find_parent_of_kind(node, "assignment_expression").is_some() {
+        if self
+            .find_parent_of_kind(node, "assignment_expression")
+            .is_some()
+        {
             return CompletionContext::VariableAssignment;
         }
 
         CompletionContext::GlobalScope
     }
 
-    async fn get_struct_member_completions(&self, struct_type: &str, prefix: &str) -> Vec<CompletionItem>
-    {
+    async fn get_struct_member_completions(
+        &self,
+        struct_type: &str,
+        prefix: &str,
+    ) -> Vec<CompletionItem> {
         let mut suggestions = Vec::new();
 
         // Check builtin structs first
@@ -64,12 +77,12 @@ impl Backend {
                     detail: Some("level.flag".to_string()),
                     documentation: Some(Documentation::MarkupContent(MarkupContent {
                         kind: MarkupKind::Markdown,
-                        value: "Level flag status".to_string()
+                        value: "Level flag status".to_string(),
                     })),
                     ..Default::default()
                 });
                 // Add more level members...
-            },
+            }
             "self" | "player" => {
                 // Add player/entity members
                 suggestions.push(CompletionItem {
@@ -79,7 +92,7 @@ impl Backend {
                     ..Default::default()
                 });
                 // Add more player members...
-            },
+            }
             "game" => {
                 // Add game-specific members
                 suggestions.push(CompletionItem {
@@ -89,7 +102,7 @@ impl Backend {
                     ..Default::default()
                 });
                 // Add more game members...
-            },
+            }
             _ => {
                 // Check if it's a user-defined struct
                 // This would require struct definition parsing
@@ -102,10 +115,16 @@ impl Backend {
         suggestions
     }
 
-    async fn get_function_call_completions(&self, tree: &Tree, source: &str, pos: Position, function_name: &str, prefix: &str) -> Vec<CompletionItem>
-    {
+    async fn get_function_call_completions(
+        &self,
+        tree: &Tree,
+        source: &str,
+        pos: Position,
+        function_name: &str,
+        prefix: &str,
+    ) -> Vec<CompletionItem> {
         let mut suggestions = Vec::new();
-        let Some(node) = self.node_at_pos(tree, source, pos) else {
+        let Some(_node) = self.node_at_pos(tree, source, pos) else {
             return Vec::new();
         };
 
@@ -118,14 +137,15 @@ impl Backend {
                 suggestions.push(CompletionItem {
                     label: param.name.clone(),
                     kind: Some(CompletionItemKind::VARIABLE),
-                    detail: Some(format!("{} ({})",
+                    detail: Some(format!(
+                        "{} ({})",
                         param.name,
                         match param.ptype {
                             GscType::Int => "int",
                             GscType::Float => "float",
                             GscType::String => "string",
                             // ... other types
-                            _ => "any"
+                            _ => "any",
                         }
                     )),
                     ..Default::default()

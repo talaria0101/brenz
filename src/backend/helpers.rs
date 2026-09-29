@@ -10,8 +10,12 @@ use tree_sitter::{Node, Tree};
 
 impl Backend {
     /// Helper to find node at position
-    pub fn node_at_pos<'a>(&self, tree: &'a Tree, source: &str, position: Position) -> Option<Node<'a>>
-    {
+    pub fn node_at_pos<'a>(
+        &self,
+        tree: &'a Tree,
+        source: &str,
+        position: Position,
+    ) -> Option<Node<'a>> {
         let byte_offset = Self::position_to_byte(source, position);
         let root = tree.root_node();
 
@@ -55,8 +59,7 @@ impl Backend {
         &line[start..end]
     }
 
-    pub(crate) fn byte_to_position(source: &str, byte_offset: usize) -> Position
-    {
+    pub(crate) fn byte_to_position(source: &str, byte_offset: usize) -> Position {
         let mut line = 0;
         let mut character = 0;
 
@@ -76,8 +79,7 @@ impl Backend {
         Position { line, character }
     }
 
-    pub(crate) fn position_to_byte(source: &str, position: Position) -> usize
-    {
+    pub(crate) fn position_to_byte(source: &str, position: Position) -> usize {
         let mut byte_offset = 0;
         let mut current_line = 0;
         let mut current_char = 0;
@@ -101,9 +103,11 @@ impl Backend {
     }
 
     pub(crate) async fn get_function(
-        &self, uri: &Uri, name: String, comment: bool
-    ) -> Option<(Range, Option<String>)>
-    {
+        &self,
+        uri: &Uri,
+        name: String,
+        comment: bool,
+    ) -> Option<(Range, Option<String>)> {
         // The engine interns names lowercased, so `Foo` and `foo` are
         // the same function. Prefer the exact spelling, then fall back
         // to a case-insensitive scan.
@@ -111,15 +115,16 @@ impl Backend {
         let func = fn_defs.get(uri)?;
         let hit = func.get(&name).or_else(|| {
             let lower = name.to_lowercase();
-            func.iter().find(|(k, _)| k.to_lowercase() == lower).map(|(_, v)| v)
+            func.iter()
+                .find(|(k, _)| k.to_lowercase() == lower)
+                .map(|(_, v)| v)
         })?;
         let cmt = if comment { hit.1.clone() } else { None };
 
         Some((hit.0, cmt))
     }
 
-    pub(crate) fn info_from_builtin<T: ScriptCallable>(builtin: &T, sign: &str) -> String
-    {
+    pub(crate) fn info_from_builtin<T: ScriptCallable>(builtin: &T, sign: &str) -> String {
         let info = builtin.info();
         let called_on = builtin.called_on();
         let example = builtin.example();
@@ -127,20 +132,20 @@ impl Backend {
         txt.push_str(&format!("## `{}`\n", sign));
         if called_on.is_empty() {
             txt.push_str("___\n");
-        }
-        else {
+        } else {
             txt.push_str(&format!("Called on: `{called_on}`\n___\n"));
         }
         txt.push_str("Builtin Method\n___\n");
-        txt.push_str(&format!("{}\n___\nExample:\n", &info));
-        txt.push_str(&format!("```gsc\n{}\n```", &example));
+        txt.push_str(&format!("{}\n___\nExample:\n", info));
+        txt.push_str(&format!("```gsc\n{}\n```", example));
         txt
     }
 
     pub(crate) async fn hover_info(
-        &self, data: (Location, Option<String>), current_uri: Uri
-    ) -> Option<String>
-    {
+        &self,
+        data: (Location, Option<String>),
+        current_uri: Uri,
+    ) -> Option<String> {
         let location = data.0;
         let tsrc = {
             let dc = self.docs_content.lock().await;
@@ -154,30 +159,31 @@ impl Backend {
         let mut txt = String::new();
         txt.push_str(&format!("{func}\n___\n"));
         if location.uri != current_uri {
-            txt.push_str(&format!("File: ``{}``\n___\n", location.uri.path().as_str()));
+            txt.push_str(&format!(
+                "File: ``{}``\n___\n",
+                location.uri.path().as_str()
+            ));
         }
         if let Some(cmt) = data.1 {
-            txt.push_str(&format!("{}", cmt));
+            txt.push_str(&cmt);
         }
 
-        if txt.trim().len() != 0 {
+        if !txt.trim().is_empty() {
             return Some(txt);
         }
 
         None
     }
 
-    pub(crate) async fn get_syms(&self, uri: &Uri) -> Option<Vec<DocumentSymbol>>
-    {
+    pub(crate) async fn get_syms(&self, uri: &Uri) -> Option<Vec<DocumentSymbol>> {
         let sym_defs = self.sym_defs.lock().await;
-        match sym_defs.get(uri) {
-            Some(defs) => Some(defs.clone()),
-            None => None
-        }
+        sym_defs.get(uri).cloned()
     }
 
-    pub(crate) fn comp_item_for_builtin<T: ScriptCallable>(name: &str, builtin: &T) -> CompletionItem
-    {
+    pub(crate) fn comp_item_for_builtin<T: ScriptCallable>(
+        name: &str,
+        builtin: &T,
+    ) -> CompletionItem {
         let camel_name = builtin.camel_name().unwrap_or(name.to_string());
         let sign = builtin.sign();
         let params = builtin.param_names();
@@ -186,13 +192,13 @@ impl Backend {
         let item_kind = match kind.as_str() {
             "Builtin Function" => CompletionItemKind::FUNCTION,
             "Builtin Method" => CompletionItemKind::METHOD,
-            _ => CompletionItemKind::KEYWORD
+            _ => CompletionItemKind::KEYWORD,
         };
 
         let doc_string = Self::info_from_builtin(builtin, &sign); // reuse sign
         let doc = Documentation::MarkupContent(MarkupContent {
             kind: MarkupKind::Markdown,
-            value: doc_string
+            value: doc_string,
         });
 
         let mut inset_text = String::new();

@@ -24,6 +24,8 @@ pub struct BracketChecker {
 }
 
 impl BracketChecker {
+    /// Empty checker, ready to scan. Reused across files by clearing
+    /// on every `check` call.
     pub fn new() -> Self {
         Self {
             stack: Vec::new(),
@@ -33,6 +35,8 @@ impl BracketChecker {
     }
 
     pub fn check(&mut self, source: &str) -> Vec<SyntaxError> {
+        // One byte-offset pass over the file. Strings and comments
+        // hide their brackets; everything unclosed gets reported.
         self.stack.clear();
         self.errors.clear();
         self.src = source.to_string();
@@ -143,6 +147,8 @@ impl BracketChecker {
     }
 
     fn error(&mut self, start: usize, end: usize, message: &str) {
+        // Byte offsets convert to LSP ranges through the shared
+        // helper, so these agree with the tree-sitter diagnostics.
         // Byte offsets come from scanning this exact source, so they
         // are always char boundaries except for pathological slicing,
         // which the helper clamps by construction.
@@ -154,6 +160,9 @@ impl BracketChecker {
     }
 
     fn check_closing_bracket(&mut self, ch: char, pos: usize) {
+        // A match pops quietly. A mismatch blames the closer and
+        // keeps the opener around: it is usually still open. A lone
+        // closer with an empty stack is simply unexpected.
         let expected = match ch {
             ')' => '(',
             ']' => '[',
@@ -193,6 +202,7 @@ impl BracketChecker {
     }
 
     fn closing_for(open_ch: char) -> char {
+        // The bracket that would have made this one happy.
         match open_ch {
             '(' => ')',
             '[' => ']',
@@ -234,11 +244,7 @@ mod tests {
 
     fn check(src: &str) -> Vec<String> {
         let mut checker = BracketChecker::new();
-        checker
-            .check(src)
-            .into_iter()
-            .map(|e| e.message)
-            .collect()
+        checker.check(src).into_iter().map(|e| e.message).collect()
     }
 
     #[test]
@@ -291,9 +297,16 @@ mod tests {
     #[test]
     fn unclosed_string_at_newline_and_eof() {
         let errs = check("main()\n{\n\ts = \"abc;\n}\n");
-        assert!(errs.iter().any(|m| m.contains("cannot span multiple lines")), "{errs:?}");
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("cannot span multiple lines")),
+            "{errs:?}"
+        );
         let errs = check("main()\n{\n\ts = \"abc;");
-        assert!(errs.iter().any(|m| m == "Unclosed string literal"), "{errs:?}");
+        assert!(
+            errs.iter().any(|m| m == "Unclosed string literal"),
+            "{errs:?}"
+        );
     }
 
     #[test]

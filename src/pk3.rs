@@ -43,7 +43,8 @@ impl Pk3Entry {
     /// Precedence rank, highest wins: later game path first, then
     /// later archive file name (so `pak1.pk3` overrides `pak0.pk3`).
     fn rank(&self) -> (usize, String) {
-        let file = self.pk3_path
+        let file = self
+            .pk3_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
@@ -53,7 +54,7 @@ impl Pk3Entry {
 
 /// Order hits best-first by precedence rank.
 fn best_first(mut hits: Vec<Pk3Entry>) -> Vec<Pk3Entry> {
-    hits.sort_by(|a, b| b.rank().cmp(&a.rank()));
+    hits.sort_by_key(|e| std::cmp::Reverse(e.rank()));
     hits
 }
 
@@ -119,9 +120,11 @@ impl Pk3Index {
             .filter(|k| k.ends_with(suffix.as_str()))
             .collect();
         keys.sort();
-        best_first(keys.into_iter()
-            .flat_map(|k| self.entries.get(k).unwrap().clone())
-            .collect())
+        best_first(
+            keys.into_iter()
+                .flat_map(|k| self.entries.get(k).unwrap().clone())
+                .collect(),
+        )
     }
 
     /// Read a script's text from its archive.
@@ -142,17 +145,16 @@ impl Pk3Index {
     /// With no workspace root the index is built in memory only.
     /// Relative game paths resolve against the workspace root, so the
     /// server's working directory never matters.
-    pub(crate) fn load_or_build(
-        workspace_root: Option<&PathBuf>,
-        game_paths: &[PathBuf],
-    ) -> Self {
+    pub(crate) fn load_or_build(workspace_root: Option<&PathBuf>, game_paths: &[PathBuf]) -> Self {
         let game_paths: Vec<PathBuf> = game_paths
             .iter()
             .map(|p| {
                 if p.is_absolute() {
                     p.clone()
                 } else {
-                    workspace_root.map(|r| r.join(p)).unwrap_or_else(|| p.clone())
+                    workspace_root
+                        .map(|r| r.join(p))
+                        .unwrap_or_else(|| p.clone())
                 }
             })
             .collect();
@@ -162,12 +164,13 @@ impl Pk3Index {
             return Self::default();
         }
 
-        let cache_path = workspace_root
-            .map(|r| r.join(CACHE_DIR_NAME).join(CACHE_SUBDIR_NAME).join(CACHE_FILE_NAME));
+        let cache_path = workspace_root.map(|r| {
+            r.join(CACHE_DIR_NAME)
+                .join(CACHE_SUBDIR_NAME)
+                .join(CACHE_FILE_NAME)
+        });
 
-        let mut cached = cache_path
-            .as_ref()
-            .and_then(|p| read_cache(p, game_paths));
+        let mut cached = cache_path.as_ref().and_then(|p| read_cache(p, game_paths));
 
         let mut index = Self::default();
         let mut fresh: Vec<CachedArchive> = Vec::new();
@@ -178,17 +181,17 @@ impl Pk3Index {
                 Some(m) => m,
                 None => continue,
             };
-            if let Some(reused) = cached
-                .as_mut()
-                .and_then(|c| c.take_matching(&meta))
-            {
+            if let Some(reused) = cached.as_mut().and_then(|c| c.take_matching(&meta)) {
                 let order = dir_order_of(game_paths, &meta.path);
                 for e in &reused.entries {
-                    index.insert(&e.key, Pk3Entry {
-                        pk3_path: meta.path.clone(),
-                        inner_path: e.inner.clone(),
-                        dir_order: order,
-                    });
+                    index.insert(
+                        &e.key,
+                        Pk3Entry {
+                            pk3_path: meta.path.clone(),
+                            inner_path: e.inner.clone(),
+                            dir_order: order,
+                        },
+                    );
                 }
                 fresh.push(reused);
                 continue;
@@ -196,11 +199,14 @@ impl Pk3Index {
             match scan_archive(pk3) {
                 Ok(scanned) => {
                     for (key, inner) in &scanned {
-                        index.insert(key, Pk3Entry {
-                            pk3_path: pk3.clone(),
-                            inner_path: inner.clone(),
-                            dir_order,
-                        });
+                        index.insert(
+                            key,
+                            Pk3Entry {
+                                pk3_path: pk3.clone(),
+                                inner_path: inner.clone(),
+                                dir_order,
+                            },
+                        );
                     }
                     fresh.push(CachedArchive {
                         path: meta.path.clone(),
@@ -254,8 +260,8 @@ impl Pk3Index {
 fn read_member_case_insensitive(pk3_path: &Path, inner_path: &str) -> io::Result<String> {
     let wanted = Pk3Index::normalize(inner_path);
     let file = File::open(pk3_path)?;
-    let mut zip = zip::ZipArchive::new(file)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut zip =
+        zip::ZipArchive::new(file).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     for i in 0..zip.len() {
         let mut f = zip
             .by_index(i)
@@ -333,20 +339,13 @@ fn list_pk3_archives(game_paths: &[PathBuf]) -> Vec<(usize, PathBuf)> {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) => {
-                logprint!(
-                    LogType::Error,
-                    "Skipping game path {}: {e}",
-                    dir.display()
-                );
+                logprint!(LogType::Error, "Skipping game path {}: {e}", dir.display());
                 continue;
             }
         };
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_file()
-                && p.extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("pk3"))
-            {
+            if p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pk3")) {
                 out.push((dir_order, p));
             }
         }
@@ -355,11 +354,12 @@ fn list_pk3_archives(game_paths: &[PathBuf]) -> Vec<(usize, PathBuf)> {
     out
 }
 
-/// Central-directory listing of one archive: `(key, inner_path)` pairs.
+/// Read one archive's central directory without touching file
+/// contents: names and cases only, which is all the index needs.
 fn scan_archive(pk3: &Path) -> io::Result<Vec<(String, String)>> {
     let file = File::open(pk3)?;
-    let mut zip = zip::ZipArchive::new(file)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut zip =
+        zip::ZipArchive::new(file).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut out = Vec::new();
     for i in 0..zip.len() {
         let f = zip
@@ -416,6 +416,9 @@ impl PendingCache {
     }
 }
 
+/// Read the on-disk cache, or bail (`None`) when anything looks
+/// off: missing file, bad parse, or different game paths. A missed
+/// cache just means rescanning, never an error.
 fn read_cache(path: &Path, game_paths: &[PathBuf]) -> Option<PendingCache> {
     let content = std::fs::read_to_string(path).ok()?;
     let file: Pk3CacheFile = ron::from_str(&content).ok()?;
@@ -431,12 +434,15 @@ fn read_cache(path: &Path, game_paths: &[PathBuf]) -> Option<PendingCache> {
     })
 }
 
+/// Write the fresh cache and sweep the old TOML file away so stale
+/// formats never linger beside the new one.
 fn write_cache(path: &Path, file: &Pk3CacheFile) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let content = ron::ser::to_string_pretty(file, ron::ser::PrettyConfig::new().struct_names(true))
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let content =
+        ron::ser::to_string_pretty(file, ron::ser::PrettyConfig::new().struct_names(true))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     std::fs::write(path, content)?;
     // Drop the artifact of the old TOML cache, if present.
     let _ = std::fs::remove_file(path.with_file_name(OLD_CACHE_FILE_NAME));
@@ -553,10 +559,7 @@ mod tests {
         let index = Pk3Index::load_or_build(None, &[dir]);
         let hits = index.lookup(Some("maps/mp/"), "dm");
         assert_eq!(hits.len(), 2);
-        assert_eq!(
-            hits[0].pk3_path.file_name().unwrap(),
-            "pak1.pk3"
-        );
+        assert_eq!(hits[0].pk3_path.file_name().unwrap(), "pak1.pk3");
     }
 
     #[test]
@@ -572,7 +575,7 @@ mod tests {
         let root = fresh_temp_dir("pk3cache_ws");
         let games = fresh_temp_dir("pk3cache_games");
         make_pk3(&games, "pak0.pk3", &[("maps/mp/dm.gsc", "main() {}\n")]);
-        let first = Pk3Index::load_or_build(Some(&root), &[games.clone()]);
+        let first = Pk3Index::load_or_build(Some(&root), std::slice::from_ref(&games));
         assert_eq!(first.entry_count(), 1);
         let cache_file = root.join(".cache/brenz/pk3_index.ron");
         assert!(cache_file.exists());

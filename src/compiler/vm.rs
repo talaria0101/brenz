@@ -38,13 +38,8 @@ pub(crate) struct RunResult {
     pub output: Vec<String>,
 }
 
-impl Default for Value {
-    fn default() -> Self {
-        Value::Undefined
-    }
-}
-
 struct Frame {
+    // One call's world: its locals plus the `self` it was invoked on.
     locals: Vec<Value>,
     self_val: Value,
 }
@@ -61,6 +56,7 @@ pub(crate) struct Vm<'a> {
 
 impl<'a> Vm<'a> {
     pub(crate) fn new(program: &'a Program, seed: u64, fuel: u64) -> Self {
+        // Globals start undefined and fill in when `__globals` runs.
         Self {
             program,
             stack: Vec::new(),
@@ -91,10 +87,15 @@ impl<'a> Vm<'a> {
         self_val: Value,
         args: Vec<Value>,
     ) -> Result<Value, RuntimeError> {
-        let info = self.program.functions.get(name).cloned().ok_or_else(|| RuntimeError {
-            pos: 0,
-            message: format!("unknown function '{name}'"),
-        })?;
+        let info = self
+            .program
+            .functions
+            .get(name)
+            .cloned()
+            .ok_or_else(|| RuntimeError {
+                pos: 0,
+                message: format!("unknown function '{name}'"),
+            })?;
         if self.frames.len() >= MAX_CALL_DEPTH {
             return Err(RuntimeError {
                 pos: 0,
@@ -110,14 +111,21 @@ impl<'a> Vm<'a> {
     }
 
     fn frame(&self) -> &Frame {
+        // The running call is always on top; an empty frame stack
+        // would mean the compiler emitted nonsense.
         self.frames.last().expect("no frame")
     }
 
     fn frame_mut(&mut self) -> &mut Frame {
+        // Mutable twin of `frame`, for storing locals.
         self.frames.last_mut().expect("no frame")
     }
 
     fn pop(&mut self, pos: usize) -> Result<Value, RuntimeError> {
+        // Plain stack pop with a position attached, so underflow
+        // still points somewhere.
+        // Underflow means unbalanced codegen, which is a compiler bug
+        // rather than a script bug, but it still gets a position.
         self.stack.pop().ok_or(RuntimeError {
             pos,
             message: "stack underflow".to_string(),
@@ -137,6 +145,8 @@ impl<'a> Vm<'a> {
     }
 
     fn execute(&mut self, entry: usize) -> Result<Value, RuntimeError> {
+        // The hot loop: fetch, run, advance. Calls recurse into fresh
+        // `execute` invocations so each keeps its own program counter.
         let mut pc = entry;
         loop {
             if self.fuel == 0 {
@@ -185,7 +195,11 @@ impl<'a> Vm<'a> {
                     self.stack.push(Value::IStr(s));
                 }
                 Op::Dup => {
-                    let v = self.stack.last().cloned().ok_or_else(|| fail("stack underflow".into()))?;
+                    let v = self
+                        .stack
+                        .last()
+                        .cloned()
+                        .ok_or_else(|| fail("stack underflow".into()))?;
                     self.stack.push(v);
                 }
                 Op::DropTop => {
@@ -195,7 +209,12 @@ impl<'a> Vm<'a> {
                     let Operand::Slot(i) = instr.arg else {
                         unreachable!()
                     };
-                    let v = self.frame().locals.get(i as usize).cloned().unwrap_or(Value::Undefined);
+                    let v = self
+                        .frame()
+                        .locals
+                        .get(i as usize)
+                        .cloned()
+                        .unwrap_or(Value::Undefined);
                     self.stack.push(v);
                 }
                 Op::SetLocal => {
@@ -213,7 +232,11 @@ impl<'a> Vm<'a> {
                     let Operand::Slot(i) = instr.arg else {
                         unreachable!()
                     };
-                    let v = self.globals.get(i as usize).cloned().unwrap_or(Value::Undefined);
+                    let v = self
+                        .globals
+                        .get(i as usize)
+                        .cloned()
+                        .unwrap_or(Value::Undefined);
                     self.stack.push(v);
                 }
                 Op::SetGlobal => {
@@ -226,7 +249,9 @@ impl<'a> Vm<'a> {
                     }
                     self.globals[i as usize] = v;
                 }
-                Op::NewArray => self.stack.push(Value::Array(Rc::new(RefCell::new(Vec::new())))),
+                Op::NewArray => self
+                    .stack
+                    .push(Value::Array(Rc::new(RefCell::new(Vec::new())))),
                 Op::GetIndex => {
                     let index = self.pop(pos)?;
                     let base = self.pop(pos)?;
@@ -239,7 +264,11 @@ impl<'a> Vm<'a> {
                     let v = if i < 0 {
                         Value::Undefined
                     } else {
-                        items.borrow().get(i as usize).cloned().unwrap_or(Value::Undefined)
+                        items
+                            .borrow()
+                            .get(i as usize)
+                            .cloned()
+                            .unwrap_or(Value::Undefined)
                     };
                     self.stack.push(v);
                 }
@@ -273,7 +302,11 @@ impl<'a> Vm<'a> {
                     let base = self.pop(pos)?;
                     match base {
                         Value::Struct(fields) => {
-                            let v = fields.borrow().get(&field).cloned().unwrap_or(Value::Undefined);
+                            let v = fields
+                                .borrow()
+                                .get(&field)
+                                .cloned()
+                                .unwrap_or(Value::Undefined);
                             self.stack.push(v);
                         }
                         // Idiomatic `a.size`, like the engine's field.
@@ -405,7 +438,10 @@ impl<'a> Vm<'a> {
                 Op::BitNot => {
                     let v = self.pop(pos)?;
                     let Value::Int(i) = v else {
-                        return Err(fail(format!("~ cannot be applied to \"{}\"", v.type_name())));
+                        return Err(fail(format!(
+                            "~ cannot be applied to \"{}\"",
+                            v.type_name()
+                        )));
                     };
                     self.stack.push(Value::Int(!i));
                 }
@@ -451,7 +487,11 @@ impl<'a> Vm<'a> {
                     let v = self.pop(pos)?;
                     // The engine applies `++`/`--` to ints only.
                     let Value::Int(i) = v else {
-                        let what = if matches!(instr.op, Op::Inc) { "++" } else { "--" };
+                        let what = if matches!(instr.op, Op::Inc) {
+                            "++"
+                        } else {
+                            "--"
+                        };
                         return Err(fail(format!(
                             "{what} must be applied to an int (applied to {})",
                             v.type_name()
@@ -535,10 +575,7 @@ impl<'a> Vm<'a> {
                     let z = self.pop(pos)?;
                     let y = self.pop(pos)?;
                     let x = self.pop(pos)?;
-                    let c = |v: Value| {
-                        v.cast_float()
-                            .map_err(|e| RuntimeError { pos, message: e })
-                    };
+                    let c = |v: Value| v.cast_float().map_err(|e| RuntimeError { pos, message: e });
                     self.stack.push(Value::Vec3([c(x)?, c(y)?, c(z)?]));
                 }
                 Op::NeedGame => {

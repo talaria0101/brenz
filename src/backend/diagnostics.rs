@@ -8,12 +8,15 @@
 //! parsed target errors. Targets that fail to parse are skipped, since
 //! their definition lists are partial.
 
-use tower_lsp_server as tower_lsp;
 use super::Backend;
 use tower_lsp::lsp_types::*;
+use tower_lsp_server as tower_lsp;
 use tree_sitter::Node;
 
 impl Backend {
+    /// Project-aware checks for one open document: unknown calls and
+    /// unresolvable foreign references. Only runs on clean parses so
+    /// half-broken trees never produce noise.
     pub(crate) async fn script_diagnostics(&self, uri: &Uri) -> Vec<Diagnostic> {
         let (tree, src) = {
             let trees = self.trees.lock().await;
@@ -44,7 +47,10 @@ impl Backend {
         Self::find_descendants_of_kind(root, "direct_call", &mut calls);
         Self::find_descendants_of_kind(root, "thread_call", &mut calls);
         for node in calls {
-            if self.find_child_of_kind(node, "foreign_function_ptr").is_some() {
+            if self
+                .find_child_of_kind(node, "foreign_function_ptr")
+                .is_some()
+            {
                 continue;
             }
             // `thread [[f]]()` carries no name to check.
@@ -80,12 +86,17 @@ impl Backend {
         out
     }
 
+    /// True when a name is a known builtin (function or method),
+    /// looked up case-insensitively like the engine does.
     async fn is_builtin(&self, name: &str) -> bool {
         let key = name.to_lowercase();
         let b = self.builtins_doc.lock().await;
         b.functions.contains_key(&key) || b.methods.contains_key(&key)
     }
 
+    /// Check one foreign reference: resolve the script (warning when
+    /// it exists nowhere), then the function inside it (error when the
+    /// target parsed cleanly but lacks it).
     async fn check_foreign_fn(&self, node: Node<'_>, src: &str, out: &mut Vec<Diagnostic>) {
         let Some((path, script, func)) = self.process_foreign_fn(node, src) else {
             return;
@@ -106,7 +117,11 @@ impl Backend {
             ));
             return;
         };
-        if self.get_function(&target, func.clone(), false).await.is_some() {
+        if self
+            .get_function(&target, func.clone(), false)
+            .await
+            .is_some()
+        {
             return;
         }
         // Only blame the target when it parsed cleanly; error recovery
@@ -128,6 +143,8 @@ impl Backend {
         }
     }
 
+    /// One diagnostic at a node's range, with the house source label
+    /// and a machine-readable code for quickfixes to match on.
     fn script_diag(
         src: &str,
         node: &Node,
@@ -156,11 +173,18 @@ impl Backend {
     /// Lowercased identifier names inside the function definition
     /// containing `pos`, for collision-free fix generation. Compared
     /// case-insensitively: clobbering `I` with `i` would be just as bad.
-    fn function_identifiers(&self, tree: &tree_sitter::Tree, src: &str, pos: usize) -> std::collections::HashSet<String> {
+    fn function_identifiers(
+        &self,
+        tree: &tree_sitter::Tree,
+        src: &str,
+        pos: usize,
+    ) -> std::collections::HashSet<String> {
         let mut out = std::collections::HashSet::new();
         let mut funcs = Vec::new();
         Self::find_descendants_of_kind(tree.root_node(), "function_definition", &mut funcs);
-        let func = funcs.into_iter().find(|n| n.start_byte() <= pos && pos <= n.end_byte());
+        let func = funcs
+            .into_iter()
+            .find(|n| n.start_byte() <= pos && pos <= n.end_byte());
         let Some(func) = func else {
             return out;
         };
@@ -177,7 +201,11 @@ impl Backend {
 
 /// First candidate not taken (case-insensitively), else `fallback`
 /// with a counter suffix.
-fn pick_name(taken: &std::collections::HashSet<String>, candidates: &[&str], fallback: &str) -> String {
+fn pick_name(
+    taken: &std::collections::HashSet<String>,
+    candidates: &[&str],
+    fallback: &str,
+) -> String {
     for c in candidates {
         if !taken.contains(&c.to_lowercase()) {
             return c.to_string();
@@ -238,7 +266,10 @@ impl Backend {
             body = body.named_child(0).unwrap();
         }
 
-        let line_start = src[..node.start_byte()].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let line_start = src[..node.start_byte()]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
         let base: String = src[line_start..node.start_byte()]
             .chars()
             .take_while(|c| *c == ' ' || *c == '\t')
@@ -259,10 +290,7 @@ impl Backend {
             (String::new(), hay_text.clone())
         } else {
             let hay_var = pick_name(&taken, &["hay", "array", "list"], "foreach_hay");
-            (
-                format!("{base}{hay_var} = {hay_text};\n"),
-                hay_var,
-            )
+            (format!("{base}{hay_var} = {hay_text};\n"), hay_var)
         };
 
         let part = if body.kind() == "block" {
@@ -281,7 +309,10 @@ impl Backend {
             }
             inner_text
         } else {
-            format!("{inner}{}", src[body.start_byte()..body.end_byte()].trim_end())
+            format!(
+                "{inner}{}",
+                src[body.start_byte()..body.end_byte()].trim_end()
+            )
         };
 
         let new_text = format!(

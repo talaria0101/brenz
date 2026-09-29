@@ -2,8 +2,8 @@
 //!
 //! Thanks to ChatGPT for guidance
 
-use serde::{Deserialize, Deserializer};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 
 /*
@@ -24,9 +24,11 @@ where S: Serializer, V: Serialize
 */
 
 pub(crate) fn deserialize_lower_map<'de, D, V>(
-    deserializer: D
+    deserializer: D,
 ) -> Result<HashMap<String, V>, D::Error>
-where D: Deserializer<'de>, V: DeserializeOwned
+where
+    D: Deserializer<'de>,
+    V: DeserializeOwned,
 {
     let raw = HashMap::<String, V>::deserialize(deserializer)?;
     let mut lowered = HashMap::with_capacity(raw.len());
