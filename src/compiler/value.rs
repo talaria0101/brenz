@@ -32,6 +32,10 @@ pub(crate) enum Value {
     Struct(Rc<RefCell<HashMap<String, Value>>>),
     /// `::name` function reference for `[[f]]()` calls.
     Func(String),
+    /// Engine game object (entity and friends). Only used as a static
+    /// stand-in for declared builtin signatures, never constructed
+    /// by the VM itself.
+    Entity,
 }
 
 impl Value {
@@ -46,6 +50,7 @@ impl Value {
             Value::Array(_) => "array",
             Value::Struct(_) => "struct",
             Value::Func(_) => "function",
+            Value::Entity => "entity",
         }
     }
 
@@ -85,6 +90,7 @@ impl Value {
             (Value::IStr(x), Value::IStr(y)) => x == y,
             (Value::Vec3(x), Value::Vec3(y)) => x == y,
             (Value::Array(x), Value::Array(y)) => x == y,
+            (Value::Entity, Value::Entity) => true,
             _ => false,
         })
     }
@@ -291,6 +297,7 @@ impl fmt::Display for Value {
                 write!(f, "}}")
             }
             Value::Func(name) => write!(f, "::{name}"),
+            Value::Entity => write!(f, "entity"),
         }
     }
 }
@@ -313,7 +320,7 @@ fn fmt_vec(v: &[f32; 3]) -> String {
 
 /// Mirrors the engine's zero-literal check: `atoi` yielding 0 is only a
 /// valid cast when the text actually spells zero.
-fn is_zero_literal(s: &str) -> bool {
+pub(crate) fn is_zero_literal(s: &str) -> bool {
     let t = s.trim();
     !t.is_empty() && t.bytes().all(|b| b == b'0' || b == b'.')
 }

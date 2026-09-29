@@ -140,8 +140,49 @@ mod tests {
         assert_eq!(err.value, value::Value::Int(7));
     }
 
+    fn check_ok(src: &str) {
+        let tree = parse(src);
+        assert!(compile(&tree, src).is_ok(), "{src}");
+    }
+
+    fn check_err(src: &str, want: &str) {
+        let tree = parse(src);
+        let errs = compile(&tree, src).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains(want)),
+            "{want} not in {errs:?} for {src}"
+        );
+    }
+
     #[test]
-    fn compile_errors() {
+    fn type_errors() {
+        // Certain engine errors.
+        check_err("main()\n{\n\tx = 1 + undefined;\n}\n", "unmatching types");
+        check_err("main()\n{\n\tx = \"a\" - \"b\";\n}\n", "unmatching types");
+        check_err("main()\n{\n\tx = ( 1, 2, 3 ) * 2;\n}\n", "unmatching types");
+        check_err("main()\n{\n\tx = 1 / 0;\n}\n", "divide by 0");
+        check_err("main()\n{\n\tx = 1.5 % 2;\n}\n", "unmatching types");
+        check_err("main()\n{\n\tif ( undefined )\n\t\treturn 1;\n}\n", "cannot cast undefined to bool");
+        check_err("main()\n{\n\tx = ~1.5;\n}\n", "cannot be applied");
+        check_err("main()\n{\n\tx = (int)\"abc\";\n}\n", "cannot cast");
+        check_err("main()\n{\n\tx = ( 1, \"a\", 3 );\n}\n", "vector needs numbers");
+        check_err("main()\n{\n\ta = [];\n\tx = a[\"k\"];\n}\n", "array index must be an integer");
+        check_err("main()\n{\n\tx = sin( \"abc\" );\n}\n", "expects float");
+        check_err("main()\n{\n\tx = distance( ( 0, 0, 0 ), 5 );\n}\n", "expects vector");
+        check_err("main()\n{\n\tforeach ( v in 5 )\n\t\tprintln( v );\n}\n", "foreach needs an array");
+        // Legal code stays quiet.
+        check_ok("main()\n{\n\tx = 1 + \"a\";\n}\n");
+        check_ok("main()\n{\n\tx = undefined == undefined;\n}\n");
+        check_ok("main()\n{\n\tx = sin( 30 );\n}\n");
+        check_ok("main()\n{\n\tx = sin( \"30\" );\n}\n");
+        check_ok("main()\n{\n\tx = 1 / 2;\n}\n");
+        check_ok("main()\n{\n\tx = y + 1;\n}\n");
+        check_ok("main()\n{\n\tif ( y )\n\t\treturn 1;\n}\n");
+        check_ok("main()\n{\n\tx = getcvar( \"x\" ) + \"!\";\n}\n");
+    }
+
+    #[test]
+    fn compile_errors_break() {
         let tree = parse("main()\n{\n\tbreak;\n}\n");
         let errs = compile(&tree, "main()\n{\n\tbreak;\n}\n").unwrap_err();
         assert!(errs.iter().any(|e| e.message.contains("break outside")));

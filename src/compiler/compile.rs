@@ -20,7 +20,10 @@ use tree_sitter::Node;
 
 use super::builtin;
 use super::op::{Instr, Op, Operand};
+use super::value::{is_zero_literal, Value};
 use super::ScriptError;
+use crate::doc::{Builtins, GscType};
+use std::sync::OnceLock;
 
 /// A compiled script: shared code plus the function table.
 #[derive(Debug, Clone, Default)]
@@ -48,6 +51,87 @@ pub(crate) fn compile(tree: &tree_sitter::Tree, src: &str) -> Result<Program, Ve
 /// is a local `obj method()` call. Names come from `builtins.ron`.
 fn is_builtin_method(name: &str) -> bool {
     builtin::is_engine_method(name)
+}
+
+/// Parsed builtin signatures, for static type checks.
+fn builtin_sigs() -> &'static Builtins {
+    static SIGS: OnceLock<Builtins> = OnceLock::new();
+    SIGS.get_or_init(|| {
+        ron::from_str(include_str!("../assets/builtins.ron")).expect("builtins.ron")
+    })
+}
+
+/// Static representative for a declared return type. `None` means
+/// unknown: `any`, or object kinds without useful check semantics.
+fn return_rep(t: &GscType) -> Option<Value> {
+    use crate::doc::GscType::*;
+    match t {
+        Bool => Some(Value::Int(0)),
+        Int => Some(Value::Int(0)),
+        Float => Some(Value::Float(0.0)),
+        String => Some(Value::Str(::std::string::String::new())),
+        LString => Some(Value::IStr(::std::string::String::new())),
+        Array => Some(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(Vec::new())))),
+        Vector => Some(Value::Vec3([0.0; 3])),
+        Entity => Some(Value::Entity),
+        Any | HudElem | Struct => None,
+    }
+}
+
+/// Leading-numeric text, mirroring the engine's `atoi`/`atof` leniency:
+/// an optional sign followed by a digit (or `.` then a digit).
+fn starts_numeric(s: &str) -> bool {
+    let t = s.trim();
+    let t = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let mut chars = t.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_digit() => true,
+        Some('.') => chars.next().is_some_and(|c| c.is_ascii_digit()),
+        _ => false,
+    }
+}
+
+/// `atoi`-legal text under `CastInt`: a parsed integer, leading digits,
+/// or an actual zero spelling.
+fn castable_int_str(s: &str) -> bool {
+    let t = s.trim();
+    t.parse::<i32>().is_ok() || starts_numeric(t) || is_zero_literal(t)
+}
+
+/// Certain argument mismatch against a declared parameter type.
+/// Returns the message, or `None` when legal or unknowable. Localized
+/// strings and local structs take unclear engine paths and are never
+/// flagged, nor is anything against `any`.
+fn arg_mismatch(expected: &GscType, actual: &Value, fname: &str, pname: &str) -> Option<String> {
+    use crate::doc::GscType::*;
+    if matches!(actual, Value::IStr(_) | Value::Struct(_)) {
+        return None;
+    }
+    let ok = match expected {
+        Any | HudElem | Struct | LString => true,
+        Bool => matches!(actual, Value::Int(_) | Value::Float(_))
+            || matches!(actual, Value::Str(s) if castable_int_str(s)),
+        Int => matches!(actual, Value::Int(_) | Value::Float(_))
+            || matches!(actual, Value::Str(s) if castable_int_str(s)),
+        Float => {
+            matches!(actual, Value::Int(_) | Value::Float(_))
+                || matches!(actual, Value::Str(s) if starts_numeric(s))
+        }
+        // `CastString` converts ints, floats and vectors.
+        String => matches!(actual, Value::Str(_) | Value::Int(_) | Value::Float(_) | Value::Vec3(_)),
+        // `CastVector` accepts vectors only.
+        Vector => matches!(actual, Value::Vec3(_)),
+        Array => matches!(actual, Value::Array(_)),
+        Entity => matches!(actual, Value::Entity),
+    };
+    if ok {
+        return None;
+    }
+    let want = format!("{expected:?}").to_lowercase();
+    Some(format!(
+        "{fname} expects {want} for '{pname}', got {}",
+        actual.type_name()
+    ))
 }
 
 struct LoopCtx {
@@ -345,12 +429,12 @@ impl<'a> Compiler<'a> {
     // -- statements --------------------------------------------------
 
     fn compile_block(&mut self, node: &Node<'a>) {
+        // No early exit on errors: a language server reports every
+        // problem at once, and `None`-poisoned static values already
+        // suppress cascading follow-ups.
         for child in self.named_children(node) {
             let stmt = self.peel(child);
             self.compile_stmt(&stmt);
-            if !self.errors.is_empty() {
-                return;
-            }
         }
     }
 
@@ -393,6 +477,9 @@ impl<'a> Compiler<'a> {
                     return;
                 };
                 let cond = self.peel(cond);
+                if let Some(v) = self.static_value(&cond) {
+                    self.check_truthy(&v, &cond);
+                }
                 self.compile_expr(&cond);
                 let else_jump = self.emit_jump(Op::JumpOnFalse, node);
                 let cons = self.peel(cons);
@@ -416,6 +503,9 @@ impl<'a> Compiler<'a> {
                     return;
                 };
                 let cond = self.peel(cond);
+                if let Some(v) = self.static_value(&cond) {
+                    self.check_truthy(&v, &cond);
+                }
                 self.compile_expr(&cond);
                 let end_jump = self.emit_jump(Op::JumpOnFalse, node);
                 self.cur.as_mut().expect("no function").loops.push(LoopCtx {
@@ -564,6 +654,9 @@ impl<'a> Compiler<'a> {
         self.emit_simple(Op::DropTop, node);
         let top = self.code.len();
         let condition = self.peel(condition);
+        if let Some(v) = self.static_value(&condition) {
+            self.check_truthy(&v, &condition);
+        }
         self.compile_expr(&condition);
         let end_jump = self.emit_jump(Op::JumpOnFalse, node);
         self.cur.as_mut().expect("no function").loops.push(LoopCtx {
@@ -601,6 +694,11 @@ impl<'a> Compiler<'a> {
         let hay_id = hay_field.id();
         let needle_id = needle.id();
         let hay = self.peel(hay_field);
+        if let Some(v) = self.static_value(&hay) {
+            if !matches!(v, Value::Array(_)) {
+                self.fail(&hay, format!("foreach needs an array, got {}", v.type_name()));
+            }
+        }
         self.compile_expr(&hay);
         let arr = self.temp_slot();
         self.emit(Op::SetLocal, Operand::Slot(arr), node);
@@ -849,6 +947,11 @@ impl<'a> Compiler<'a> {
                 let mut n = 0;
                 for child in self.named_children(&node) {
                     let e = self.peel(child);
+                    if let Some(v) = self.static_value(&e) {
+                        if v.cast_float().is_err() {
+                            self.fail(&e, format!("vector needs numbers, got {}", v.type_name()));
+                        }
+                    }
                     self.compile_expr(&e);
                     n += 1;
                 }
@@ -909,6 +1012,18 @@ impl<'a> Compiler<'a> {
                 let var = self.peel(var);
                 // `var` is one of number/string/boolean/identifier/...:
                 // compile it as a general expression.
+                if let Some(v) = self.static_value(&var) {
+                    let bad = match self.text(&ty) {
+                        "int" => v.cast_int().err(),
+                        "float" => v.cast_float().err(),
+                        "bool" => v.cast_bool().err(),
+                        "string" => v.cast_string().err(),
+                        _ => None,
+                    };
+                    if let Some(message) = bad {
+                        self.fail(&var, message);
+                    }
+                }
                 self.compile_expr(&var);
                 match self.text(&ty) {
                     "int" => self.emit_simple(Op::CastInt, &node),
@@ -920,6 +1035,176 @@ impl<'a> Compiler<'a> {
             }
             _ => self.fail(&node, format!("cannot compile {}", node.kind())),
         }
+    }
+
+    /// Statically known value of an expression: literals yield their
+    /// actual values, builtin calls their declared return shape, and
+    /// pure compositions fold. Anything touching variables, the game,
+    /// or user functions is `None`: those rely on runtime.
+    fn static_value(&self, node: &Node<'a>) -> Option<Value> {
+        let node = self.peel(*node);
+        match node.kind() {
+            "number" => self.static_number(&node),
+            "string" => Some(Value::Str(unquote(self.text(&node)))),
+            "lstring" => {
+                let mut inner = String::new();
+                for child in self.named_children(&node) {
+                    if child.kind() == "string" {
+                        inner = unquote(self.text(&child));
+                    }
+                }
+                Some(Value::IStr(inner))
+            }
+            "boolean" => Some(Value::Int(i32::from(self.text(&node) == "true"))),
+            "undefined" => Some(Value::Undefined),
+            "array" => Some(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(Vec::new())))),
+            "vec1" => {
+                let mut out = None;
+                for child in self.named_children(&node) {
+                    out = self.static_value(&child);
+                }
+                out
+            }
+            "vec3" => {
+                let mut comps: Vec<f32> = Vec::new();
+                for child in self.named_children(&node) {
+                    let v = self.static_value(&child)?;
+                    comps.push(v.cast_float().ok()?);
+                }
+                if comps.len() == 3 {
+                    Some(Value::Vec3([comps[0], comps[1], comps[2]]))
+                } else {
+                    None
+                }
+            }
+            "direct_call" => {
+                let mut callee = None;
+                for child in self.named_children(&node) {
+                    if child.kind() == "identifier" {
+                        callee = Some(child);
+                    }
+                }
+                let name = self.text(&callee?).to_lowercase();
+                let sigs = builtin_sigs();
+                let f = sigs.functions.get(&name)?;
+                f.returns.as_ref().and_then(return_rep)
+            }
+            "object_call" => {
+                let method = self.object_method(&node)?;
+                let sigs = builtin_sigs();
+                let m = sigs.methods.get(&method)?;
+                m.returns.as_ref().and_then(return_rep)
+            }
+            "binary_expression" => {
+                let (l, r) = self.binary_operands(&node)?;
+                let op = self.src[l.end_byte()..r.start_byte()].trim();
+                let (Some(lv), Some(rv)) = (self.static_value(&l), self.static_value(&r)) else {
+                    return None;
+                };
+                match op {
+                    "&&" | "||" => Some(Value::Int(0)),
+                    "==" | "!=" => Value::equals(&lv, &rv).ok().map(|b| Value::Int(i32::from(b))),
+                    "<" | ">" | "<=" | ">=" => Value::compare(op, &lv, &rv)
+                        .ok()
+                        .map(|b| Value::Int(i32::from(b))),
+                    "+" | "-" | "*" | "/" | "%" => Value::arith(op.chars().next()?, &lv, &rv).ok(),
+                    "<<" | ">>" | "|" | "^" | "&" => {
+                        if matches!((&lv, &rv), (Value::Int(_), Value::Int(_))) {
+                            Some(Value::Int(0))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            "unary_expression" => {
+                let inner = self.unary_inner(&node)?;
+                let op = self.src[node.start_byte()..inner.start_byte()].trim();
+                let v = self.static_value(&inner)?;
+                match op {
+                    "+" => Some(v),
+                    "-" => match v {
+                        Value::Int(i) => Some(Value::Int(i.wrapping_neg())),
+                        Value::Float(f) => Some(Value::Float(-f)),
+                        _ => None,
+                    },
+                    "!" => Some(Value::Int(0)),
+                    "~" => matches!(v, Value::Int(_)).then_some(Value::Int(0)),
+                    _ => None,
+                }
+            }
+            "cast_expression" => {
+                let ty = node.child_by_field_name("type_name")?;
+                let var = node.child_by_field_name("var")?;
+                let v = self.static_value(&var)?;
+                match self.text(&ty) {
+                    "int" => v.cast_int().ok().map(Value::Int),
+                    "float" => v.cast_float().ok().map(Value::Float),
+                    "bool" => v.cast_bool().ok().map(Value::Int),
+                    "string" => v.cast_string().ok().map(Value::Str),
+                    _ => None,
+                }
+            }
+            "assignment_expression" => {
+                let val = node.child_by_field_name("assigned_value")?;
+                self.static_value(&val)
+            }
+            _ => None,
+        }
+    }
+
+    fn static_number(&self, node: &Node) -> Option<Value> {
+        let t = self.text(node);
+        if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+            return i32::from_str_radix(hex, 16).ok().map(Value::Int);
+        }
+        if t.contains('.') {
+            return t.parse::<f32>().ok().map(Value::Float);
+        }
+        t.parse::<i32>().ok().map(Value::Int)
+    }
+
+    /// The two operand nodes of a binary expression.
+    fn binary_operands(&self, node: &Node<'a>) -> Option<(Node<'a>, Node<'a>)> {
+        let mut kids = self.named_children(node);
+        if kids.len() != 2 {
+            return None;
+        }
+        let rhs = self.peel(kids.pop().unwrap());
+        let lhs = self.peel(kids.pop().unwrap());
+        Some((lhs, rhs))
+    }
+
+    /// The single operand node of a unary expression.
+    fn unary_inner(&self, node: &Node<'a>) -> Option<Node<'a>> {
+        let mut kids = self.named_children(node);
+        if kids.len() != 1 {
+            return None;
+        }
+        Some(self.peel(kids.pop().unwrap()))
+    }
+
+    /// The method name of an object call, if syntactically present.
+    fn object_method(&self, node: &Node<'a>) -> Option<String> {
+        let mut seen_obj = false;
+        for child in self.named_children(node) {
+            match child.kind() {
+                "identifier" => {
+                    if seen_obj {
+                        return Some(self.text(&child).to_lowercase());
+                    }
+                    seen_obj = true;
+                }
+                "local_function_ptr" => {
+                    if let Some(f) = child.child_by_field_name("function") {
+                        return Some(self.text(&f).to_lowercase());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     fn compile_number(&mut self, node: &Node<'a>) {
@@ -970,6 +1255,7 @@ impl<'a> Compiler<'a> {
         let lhs = self.peel(kids.pop().unwrap());
         // Operator text sits between the operands.
         let op = self.src[lhs.end_byte()..rhs.start_byte()].trim().to_string();
+        self.check_binary(&lhs, &rhs, &op, node);
         match op.as_str() {
             "&&" => {
                 self.compile_expr(&lhs);
@@ -1021,6 +1307,84 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// Static type check for a binary operation. Both sides must be
+    /// statically known; anything relying on runtime is skipped.
+    /// Reports the engine's own error text on mismatch.
+    fn check_binary(&mut self, lhs: &Node<'a>, rhs: &Node<'a>, op: &str, node: &Node) {
+        let (Some(lv), Some(rv)) = (self.static_value(lhs), self.static_value(rhs)) else {
+            return;
+        };
+        let err = match op {
+            "&&" => {
+                // The right side only runs when the left is true.
+                lv.truthy()
+                    .err()
+                    .or_else(|| {
+                        if lv.truthy().unwrap_or(false) {
+                            rv.truthy().err()
+                        } else {
+                            None
+                        }
+                    })
+            }
+            "||" => {
+                lv.truthy()
+                    .err()
+                    .or_else(|| {
+                        if !lv.truthy().unwrap_or(true) {
+                            rv.truthy().err()
+                        } else {
+                            None
+                        }
+                    })
+            }
+            "==" | "!=" => Value::equals(&lv, &rv).err(),
+            "<" | ">" | "<=" | ">=" => Value::compare(op, &lv, &rv).err(),
+            "+" | "-" | "*" | "/" | "%" => {
+                Value::arith(op.chars().next().unwrap(), &lv, &rv).err()
+            }
+            "<<" | ">>" | "|" | "^" | "&" => Self::check_int_only(&lv, &rv)
+                .map(|kind| format!("{kind} needs integer operands")),
+            _ => None,
+        };
+        if let Some(message) = err {
+            self.fail(node, message);
+        }
+    }
+
+    /// Shifts and bitwise ops need integers; floats may coerce at
+    /// runtime, so only certainly-wrong kinds are flagged.
+    fn check_int_only(lv: &Value, rv: &Value) -> Option<&'static str> {
+        fn bad(v: &Value) -> bool {
+            matches!(
+                v,
+                Value::Str(_) | Value::Vec3(_) | Value::Array(_) | Value::Entity | Value::Undefined
+            )
+        }
+        if bad(lv) || bad(rv) {
+            Some("operator")
+        } else {
+            None
+        }
+    }
+
+    /// Report if a known value cannot serve as a condition.
+    fn check_truthy(&mut self, v: &Value, node: &Node) {
+        if let Err(message) = v.truthy() {
+            self.fail(node, message);
+        }
+    }
+
+    /// Array indices must be integers; floats may truncate at runtime
+    /// and are left alone, everything else is certainly wrong.
+    fn check_index(&mut self, idx: &Node<'a>) {
+        if let Some(v) = self.static_value(idx) {
+            if !matches!(v, Value::Int(_) | Value::Float(_)) {
+                self.fail(idx, format!("array index must be an integer, got {}", v.type_name()));
+            }
+        }
+    }
+
     fn compile_unary(&mut self, node: &Node<'a>) {
         let mut kids = self.named_children(node);
         if kids.len() != 1 {
@@ -1029,6 +1393,20 @@ impl<'a> Compiler<'a> {
         }
         let inner = self.peel(kids.pop().unwrap());
         let op = self.src[node.start_byte()..inner.start_byte()].trim().to_string();
+        if let Some(v) = self.static_value(&inner) {
+            match op.as_str() {
+                "!" => self.check_truthy(&v, &inner),
+                "~" if !matches!(v, Value::Int(_)) => {
+                    self.fail(&inner, format!("~ cannot be applied to \"{}\"", v.type_name()));
+                }
+                "-" => {
+                    if Value::arith('-', &Value::Int(0), &v).is_err() {
+                        self.fail(&inner, format!("cannot negate {}", v.type_name()));
+                    }
+                }
+                _ => {}
+            }
+        }
         match op.as_str() {
             "!" => {
                 self.compile_expr(&inner);
@@ -1183,7 +1561,11 @@ impl<'a> Compiler<'a> {
                     return;
                 };
                 if base.kind() == "identifier" && is_game_object(self.text(&base)) {
-                    self.fail(var, format!("{} needs a game attached", self.text(&base)));
+                    self.emit(
+                        Op::NeedGame,
+                        Operand::Name(format!("{} needs a game attached", self.text(&base))),
+                        node,
+                    );
                     self.emit_simple(Op::GetUndefined, node);
                     return;
                 }
@@ -1261,10 +1643,12 @@ impl<'a> Compiler<'a> {
     fn push_addr(&mut self, base: &Node<'a>, indices: &[Node<'a>], node: &Node<'a>) {
         self.compile_expr(base);
         for idx in &indices[..indices.len().saturating_sub(1)] {
+            self.check_index(idx);
             self.compile_expr(idx);
             self.emit_simple(Op::GetIndex, node);
         }
         if let Some(last) = indices.last() {
+            self.check_index(last);
             self.compile_expr(last);
         }
     }
@@ -1357,7 +1741,33 @@ impl<'a> Compiler<'a> {
                     );
                 }
             }
+            // Declared parameter types are checked against statically
+            // known arguments; anything relying on runtime is skipped.
+            if let Some(f) = builtin_sigs().functions.get(&name) {
+                self.check_call_args(&name, &f.params, node);
+            }
             self.emit(Op::BuiltinFunction, Operand::FuncCall { name, argc }, node);
+        }
+    }
+
+    /// Check statically known call arguments against declared builtin
+    /// parameter types. Extra arguments (variadics) and missing ones
+    /// (engine-tolerated optionals) are never flagged.
+    fn check_call_args(&mut self, fname: &str, params: &[crate::doc::ScrParam], node: &Node<'a>) {
+        let mut args = Vec::new();
+        for child in self.named_children(node) {
+            if child.kind() == "argument_list" {
+                for arg in self.named_children(&child) {
+                    args.push(self.peel(arg));
+                }
+            }
+        }
+        for (param, arg) in params.iter().zip(args.iter()) {
+            if let Some(v) = self.static_value(arg) {
+                if let Some(message) = arg_mismatch(&param.ptype, &v, fname, &param.name) {
+                    self.fail(arg, message);
+                }
+            }
         }
     }
 
@@ -1446,6 +1856,11 @@ impl<'a> Compiler<'a> {
         let mut done = false;
         for child in self.named_children(&target) {
             let e = self.peel(child);
+            if let Some(v) = self.static_value(&e) {
+                if !matches!(v, Value::Func(_)) {
+                    self.fail(&e, format!("[[...]] needs a function, got {}", v.type_name()));
+                }
+            }
             if e.kind() == "identifier" {
                 self.compile_identifier(&e);
             } else if e.kind() == "foreign_function_ptr" {
@@ -1519,6 +1934,7 @@ impl<'a> Compiler<'a> {
         }
         for k in kids {
             let idx = self.peel(k);
+            self.check_index(&idx);
             self.compile_expr(&idx);
             self.emit_simple(Op::GetIndex, node);
         }
