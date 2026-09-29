@@ -54,7 +54,7 @@ fn is_builtin_method(name: &str) -> bool {
 }
 
 /// Parsed builtin signatures, for static type checks.
-fn builtin_sigs() -> &'static Builtins {
+pub(crate) fn builtin_sigs() -> &'static Builtins {
     static SIGS: OnceLock<Builtins> = OnceLock::new();
     SIGS.get_or_init(|| {
         ron::from_str(include_str!("../assets/builtins.ron")).expect("builtins.ron")

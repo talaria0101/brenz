@@ -108,7 +108,7 @@ pub struct ScrParam {
     pub info: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum GscType {
     Any,

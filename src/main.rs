@@ -64,6 +64,17 @@ impl LanguageServer for Backend {
 
         *self.workspace_root.lock().await = workspace_root;
 
+        // Remember snippet support: completions render `${1:param}`
+        // tab stops only for clients that understand them.
+        let snippet = params
+            .capabilities
+            .text_document
+            .and_then(|td| td.completion)
+            .and_then(|c| c.completion_item)
+            .and_then(|i| i.snippet_support)
+            .unwrap_or(false);
+        *self.snippet_support.lock().await = snippet;
+
         // Load the `.brenz` project config, then (re)build the `.pk3`
         // index for the configured game paths. Only the central
         // directory of each archive is read, so this stays fast.
@@ -401,27 +412,36 @@ impl LanguageServer for Backend {
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 
-    // Completions from builtins plus this file's functions and
-    // variables, filtered by the word under the cursor.
+    // Completions: builtins with call snippets, local functions the
+    // same way, in-scope variables boosted by expected type, plus
+    // keywords. Prefix and substring matches only; the client hides
+    // the rest anyway.
     async fn completion(
         &self,
         params: CompletionParams,
     ) -> jsonrpc::Result<Option<CompletionResponse>> {
+        use crate::backend::completion as comp;
+        use crate::doc::GscType;
+
         let uri = params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
 
-        let src = {
+        let (tree, src) = {
+            let trees = self.trees.lock().await;
+            let tree = match trees.get(&uri) {
+                Some(t) => t.clone(),
+                None => return Ok(None),
+            };
             let dc = self.docs_content.lock().await;
-            match dc.get(&uri) {
+            let src = match dc.get(&uri) {
                 Some(s) => s.clone(),
                 None => return Ok(None),
-            }
+            };
+            (tree, src)
         };
 
         // Check if triggered by a character
         let trigger = params.context.and_then(|ctx| ctx.trigger_character);
-
-        eprintln!("trigger: {:?}", trigger);
 
         if trigger == Some(".".to_string()) {
             // TODO: completion for struct members
@@ -430,9 +450,28 @@ impl LanguageServer for Backend {
 
         // Extract the partial word being typed from raw text
         let prefix = self.get_word_at_position(&src, pos);
-        eprintln!("Completion prefix: '{}'", prefix);
+        let byte = Self::position_to_byte(&src, pos);
+        let snippet = *self.snippet_support.lock().await;
+
+        // When completing a call argument, the callee's declared
+        // parameter type ranks same-type variables first.
+        let expected: Option<GscType> = match comp::enclosing_call(&tree, &src, byte) {
+            Some((name, index, is_method)) => {
+                let docs = self.builtins_doc.lock().await;
+                let params = if is_method {
+                    docs.methods.get(&name).map(|m| m.params.clone())
+                } else {
+                    docs.functions.get(&name).map(|f| f.params.clone())
+                };
+                params
+                    .and_then(|p| p.get(index).map(|param| param.ptype.clone()))
+                    .filter(|ty| *ty != GscType::Any)
+            }
+            None => None,
+        };
 
         let mut suggestions: Vec<CompletionItem> = Vec::new();
+        // (tier, score desc, name): same-type variables first.
 
         let (f, m) = {
             let b = self.builtins_doc.lock().await;
@@ -440,40 +479,105 @@ impl LanguageServer for Backend {
         };
 
         for (k, scr_fn) in f.iter() {
-            util::fmatch(prefix, k);
-            if k.starts_with(prefix) {
-                suggestions.push(Self::comp_item_for_builtin(k, scr_fn));
+            let score = comp::fuzzy_score(prefix, k);
+            if score == 0 {
+                continue;
             }
+            let mut item = Self::comp_item_for_builtin(k, scr_fn, snippet);
+            item.sort_text = Some(format!("1-{:04}-{k}", 9999 - score.min(9999)));
+            suggestions.push(item);
         }
 
         for (k, scr_md) in m.iter() {
-            util::fmatch(prefix, k);
-            if k.starts_with(prefix) {
-                suggestions.push(Self::comp_item_for_builtin(k, scr_md));
+            let score = comp::fuzzy_score(prefix, k);
+            if score == 0 {
+                continue;
             }
+            let mut item = Self::comp_item_for_builtin(k, scr_md, snippet);
+            item.sort_text = Some(format!("1-{:04}-{k}", 9999 - score.min(9999)));
+            suggestions.push(item);
         }
 
         if let Some(local_sym_defs) = self.sym_defs.lock().await.get(&uri) {
             for sym in local_sym_defs {
-                if sym.kind == SymbolKind::FUNCTION && sym.name.starts_with(prefix) {
+                if sym.kind == SymbolKind::FUNCTION && comp::fuzzy_score(prefix, &sym.name) > 0 {
+                    let params = comp::head_params(sym.detail.as_deref().unwrap_or(""));
+                    let (text, format) = comp::call_text(&sym.name, &params, snippet);
                     suggestions.push(CompletionItem {
                         label: sym.name.clone(),
                         kind: Some(CompletionItemKind::FUNCTION),
                         detail: sym.detail.clone(),
+                        insert_text: Some(text),
+                        insert_text_format: format,
+                        sort_text: Some(format!(
+                            "1-{:04}-{}",
+                            9999 - comp::fuzzy_score(prefix, &sym.name).min(9999),
+                            sym.name.to_lowercase()
+                        )),
                         ..Default::default()
                     });
                 }
 
                 for var in sym.children.as_ref().unwrap() {
-                    if var.kind == SymbolKind::VARIABLE && var.name.starts_with(prefix) {
+                    if var.kind == SymbolKind::VARIABLE {
+                        let score = comp::fuzzy_score(prefix, &var.name);
+                        if score == 0 {
+                            continue;
+                        }
+                        // Same-type variables float to the top when the
+                        // argument slot declares a type.
+                        let var_ty = comp::scope_vars(&tree, &src, byte)
+                            .into_iter()
+                            .find(|v| v.name == var.name)
+                            .and_then(|v| v.ty);
+                        let tier = u32::from(
+                            !(expected.is_some() && var_ty.is_some() && expected == var_ty),
+                        );
+                        let detail = match var_ty {
+                            Some(t) => format!("Variable: {t:?}").to_lowercase(),
+                            None => "Variable".to_string(),
+                        };
                         suggestions.push(CompletionItem {
                             label: var.name.clone(),
                             kind: Some(CompletionItemKind::VARIABLE),
-                            detail: Some("Variable".to_string()),
+                            detail: Some(detail),
+                            sort_text: Some(format!(
+                                "{tier}-{:04}-{}",
+                                9999 - score.min(9999),
+                                var.name.to_lowercase()
+                            )),
                             ..Default::default()
                         });
                     }
                 }
+            }
+        }
+
+        for kw in [
+            "if",
+            "else",
+            "while",
+            "for",
+            "return",
+            "break",
+            "continue",
+            "switch",
+            "case",
+            "default",
+            "wait",
+            "thread",
+            "true",
+            "false",
+            "undefined",
+            "self",
+        ] {
+            if comp::fuzzy_score(prefix, kw) > 0 {
+                suggestions.push(CompletionItem {
+                    label: kw.to_string(),
+                    kind: Some(CompletionItemKind::KEYWORD),
+                    sort_text: Some(format!("2-{kw}")),
+                    ..Default::default()
+                });
             }
         }
 

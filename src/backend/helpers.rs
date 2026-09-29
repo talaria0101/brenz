@@ -183,6 +183,7 @@ impl Backend {
     pub(crate) fn comp_item_for_builtin<T: ScriptCallable>(
         name: &str,
         builtin: &T,
+        snippet: bool,
     ) -> CompletionItem {
         let camel_name = builtin.camel_name().unwrap_or(name.to_string());
         let sign = builtin.sign();
@@ -201,11 +202,8 @@ impl Backend {
             value: doc_string,
         });
 
-        let mut inset_text = String::new();
-        inset_text.push_str(&camel_name);
-        inset_text.push('(');
-        inset_text.push_str(&params.join(", "));
-        inset_text.push(')');
+        let (inset_text, inset_format) =
+            crate::backend::completion::call_text(&camel_name, &params, snippet);
 
         CompletionItem {
             label: camel_name,
@@ -213,6 +211,7 @@ impl Backend {
             documentation: Some(doc),
             kind: Some(item_kind),
             insert_text: Some(inset_text),
+            insert_text_format: inset_format,
             ..Default::default()
         }
     }

@@ -34,6 +34,8 @@ pub struct Backend {
     pub last_edit_time: Arc<Mutex<HashMap<Uri, Instant>>>,
     /// Your workspace/project folder
     pub workspace_root: Arc<Mutex<Option<PathBuf>>>,
+    /// Whether the client renders snippet tab stops.
+    pub snippet_support: Arc<Mutex<bool>>,
     /// Stores parsed trees for each document
     pub trees: Arc<Mutex<HashMap<Uri, Tree>>>,
     /// Function Definitions
@@ -75,6 +77,7 @@ impl Backend {
             parser: Arc::new(Mutex::new(parser)),
             last_edit_time: Arc::new(Mutex::new(HashMap::new())),
             workspace_root: Arc::new(Mutex::new(None)),
+            snippet_support: Arc::new(Mutex::new(false)),
             trees: Arc::new(Mutex::new(HashMap::new())),
             fn_defs: Arc::new(Mutex::new(HashMap::new())),
             sym_defs: Arc::new(Mutex::new(HashMap::new())),
