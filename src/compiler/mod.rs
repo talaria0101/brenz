@@ -101,6 +101,18 @@ mod tests {
     }
 
     #[test]
+    fn builtin_arity() {
+        let tree = parse("main()\n{\n\tx = sin( 1, 2 );\n}\n");
+        let errs = compile(&tree, "main()\n{\n\tx = sin( 1, 2 );\n}\n").unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("expects 1 parameters, got 2")), "{errs:?}");
+        let tree = parse("main()\n{\n\tx = sin( 30 );\n}\n");
+        assert!(compile(&tree, "main()\n{\n\tx = sin( 30 );\n}\n").is_ok());
+        // Variadics are never flagged.
+        let tree = parse("main()\n{\n\tprintln( \"a\", \"b\", 1 );\n}\n");
+        assert!(compile(&tree, "main()\n{\n\tprintln( \"a\", \"b\", 1 );\n}\n").is_ok());
+    }
+
+    #[test]
     fn game_boundary_reports() {
         let err = run_src("main()\n{\n\twait 1;\n\treturn 0;\n}\n").unwrap_err();
         assert!(err.contains("needs a game scheduler"), "{err}");

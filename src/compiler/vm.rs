@@ -8,9 +8,7 @@
 //! scheduler to preempt them here.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::OnceLock;
 
 use super::builtin::{self, BuiltinError, Rng};
 use super::compile::Program;
@@ -310,7 +308,7 @@ impl<'a> Vm<'a> {
                     }
                     args.reverse();
                     if !builtin::is_pure(&name) {
-                        if is_engine_function(&name) {
+                        if builtin::is_engine_function(&name) {
                             return Err(fail(format!("{name} needs a game attached")));
                         }
                         return Err(fail(format!("unknown function '{name}'")));
@@ -569,20 +567,4 @@ impl<'a> Vm<'a> {
         self.frames.push(Frame { locals, self_val });
         self.execute(info.entry)
     }
-}
-
-/// Lowercase names of engine builtin functions (from `builtins.ron`).
-fn is_engine_function(name: &str) -> bool {
-    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
-    NAMES
-        .get_or_init(|| {
-            #[derive(serde::Deserialize)]
-            struct Builtins {
-                functions: HashMap<String, serde::de::IgnoredAny>,
-            }
-            let m: Builtins =
-                ron::from_str(include_str!("../assets/builtins.ron")).expect("builtins.ron");
-            m.functions.into_keys().collect()
-        })
-        .contains(name)
 }

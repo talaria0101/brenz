@@ -7,6 +7,8 @@
 //! effects, objectives, ...) reports `BuiltinError::Game` naming it.
 
 use super::value::Value;
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 /// Error from a builtin call.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,6 +70,63 @@ fn expect(args: &[Value], n: usize, name: &str) -> Result<(), BuiltinError> {
             "{name} expects {n} parameters, got {}",
             args.len()
         )))
+    }
+}
+
+/// Lowercase names of engine builtin functions (from `builtins.ron`).
+pub(crate) fn is_engine_function(name: &str) -> bool {
+    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            #[derive(serde::Deserialize)]
+            struct Builtins {
+                functions: HashMap<String, serde::de::IgnoredAny>,
+            }
+            let m: Builtins =
+                ron::from_str(include_str!("../assets/builtins.ron")).expect("builtins.ron");
+            m.functions.into_keys().collect()
+        })
+        .contains(name)
+}
+
+/// Lowercase names of builtin methods (from `builtins.ron`).
+pub(crate) fn is_engine_method(name: &str) -> bool {
+    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            #[derive(serde::Deserialize)]
+            struct Builtins {
+                methods: HashMap<String, serde::de::IgnoredAny>,
+            }
+            let m: Builtins =
+                ron::from_str(include_str!("../assets/builtins.ron")).expect("builtins.ron");
+            m.methods.into_keys().collect()
+        })
+        .contains(name)
+}
+
+/// Certain parameter counts, `(min, max)`, from the C implementations.
+/// Only what the engine provably enforces: strict `!=` checks, `<`
+/// minimums, and the pure builtins above. Variadics (`print`, ...) and
+/// anything optional-heavy report `None` and are never flagged.
+pub(crate) fn arity(name: &str) -> Option<(usize, Option<usize>)> {
+    let exact = |n: usize| Some((n, Some(n)));
+    match name {
+        "isdefined" | "assert" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "length"
+        | "lengthsquared" | "vectornormalize" | "vectortoangles" | "anglestoforward"
+        | "anglestoright" | "anglestoup" | "randomint" | "randomfloat" => exact(1),
+        "distance" | "distancesquared" | "vectordot" | "randomintrange" | "randomfloatrange" => {
+            exact(2)
+        }
+        "closer" => exact(3),
+        "spawnstruct" => exact(0),
+        "playfxontag" => exact(3),
+        "rewindfx" => exact(2),
+        "setcullfog" => exact(6),
+        "setexpfog" => exact(5),
+        "dodamage" => Some((2, None)),
+        "dodamagemod" => Some((3, None)),
+        _ => None,
     }
 }
 

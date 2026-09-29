@@ -1,27 +1,23 @@
 //! Parsing related methods for Backend
 
-use crate::{brace::BracketChecker, util::{LogType, logprint}};
+use crate::util::{LogType, logprint};
 use crate::compiler::compile::compile as compile_gsc;
 
-use tower_lsp_server::{self as tower_lsp, Client};
+use tower_lsp_server as tower_lsp;
 use super::Backend;
 use tower_lsp::lsp_types::*;
-use tree_sitter::{Parser, Tree};
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::Mutex;
+use tree_sitter::Tree;
+use std::collections::HashMap;
 
 impl Backend {
-    pub async fn parse_and_diagnose(
-        uri: Uri,
-        text: &str,
-        checker: Arc<Mutex<BracketChecker>>,
-        parser: Arc<Mutex<Parser>>,
-        trees: Arc<Mutex<HashMap<Uri, Tree>>>,
-        fn_defs: Arc<Mutex<HashMap<Uri, HashMap<String, (Range, Option<String>)>>>>,
-        sym_defs: Arc<Mutex<HashMap<Uri, Vec<DocumentSymbol>>>>,
-        client: Client
-    )
+    pub async fn parse_and_diagnose(&self, uri: Uri, text: &str)
     {
+        let checker = self.checker.clone();
+        let parser = self.parser.clone();
+        let trees = self.trees.clone();
+        let fn_defs = self.fn_defs.clone();
+        let sym_defs = self.sym_defs.clone();
+        let client = self.client.clone();
         //let mut checker = BracketChecker::new();
         let mut checker_guard = checker.lock().await;
         let bracket_errors = checker_guard.check(text);
@@ -47,8 +43,11 @@ impl Backend {
             return;
         }
 
-        let mut parser_guard = parser.lock().await;
-        match parser_guard.parse(&text, None) {
+        // Parse in a narrow scope: the project-aware checks below
+        // re-lock the parser for on-demand files, and holding this
+        // guard across them deadlocks the task on itself.
+        let tree = parser.lock().await.parse(&text, None);
+        match tree {
             Some(tree) => {
                 {
                     trees.lock().await.insert(uri.clone(), tree.clone());
@@ -82,6 +81,7 @@ impl Backend {
                         if let Err(errors) = compile_gsc(&tree, text) {
                             diagnostics = errors.into_iter().map(|e| e.into()).collect();
                         }
+                        diagnostics.extend(self.script_diagnostics(&uri).await);
                     }
 
                     client.publish_diagnostics(uri, diagnostics, None).await;

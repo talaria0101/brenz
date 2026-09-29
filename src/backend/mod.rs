@@ -17,6 +17,7 @@ use crate::config::BrenzConfig;
 use crate::doc::Builtins;
 use crate::pk3::Pk3Index;
 
+#[derive(Clone)]
 pub struct Backend {
     /// The tower_lsp::Client instance
     pub client: Client,
@@ -110,3 +111,4 @@ impl Backend {
 mod helpers;
 mod navigation;
 mod parsing;
+mod diagnostics;

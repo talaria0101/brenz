@@ -1,0 +1,153 @@
+//! Project-aware script diagnostics: unknown functions and scripts.
+//!
+//! Bare `foo()` calls resolve to the current file or a builtin in the
+//! engine, so a name found in neither is reported. Foreign
+//! `path\\script::func` references resolve through the workspace and
+//! the `.pk3` index (loading targets on demand, like goto-definition);
+//! an unresolvable script warns, a function missing from a cleanly
+//! parsed target errors. Targets that fail to parse are skipped, since
+//! their definition lists are partial.
+
+use tower_lsp_server as tower_lsp;
+use super::Backend;
+use tower_lsp::lsp_types::*;
+use tree_sitter::Node;
+
+impl Backend {
+    pub(crate) async fn script_diagnostics(&self, uri: &Uri) -> Vec<Diagnostic> {
+        let (tree, src) = {
+            let trees = self.trees.lock().await;
+            let tree = match trees.get(uri) {
+                Some(t) => t.clone(),
+                None => return Vec::new(),
+            };
+            let dc = self.docs_content.lock().await;
+            let src = match dc.get(uri) {
+                Some(s) => s.clone(),
+                None => return Vec::new(),
+            };
+            (tree, src)
+        };
+
+        let mut out = Vec::new();
+        let root = tree.root_node();
+
+        // Foreign references anywhere (calls and `::` pointers alike).
+        let mut foreigns = Vec::new();
+        Self::find_descendants_of_kind(root, "foreign_function_ptr", &mut foreigns);
+        for node in foreigns {
+            self.check_foreign_fn(node, &src, &mut out).await;
+        }
+
+        // Bare calls: engine resolves them to this file or a builtin.
+        let mut calls = Vec::new();
+        Self::find_descendants_of_kind(root, "direct_call", &mut calls);
+        Self::find_descendants_of_kind(root, "thread_call", &mut calls);
+        for node in calls {
+            if self.find_child_of_kind(node, "foreign_function_ptr").is_some() {
+                continue;
+            }
+            // `thread [[f]]()` carries no name to check.
+            let Some(callee) = node.child_by_field_name("function") else {
+                continue;
+            };
+            if callee.kind() != "identifier" {
+                continue;
+            }
+            let name = src[callee.start_byte()..callee.end_byte()].to_string();
+            if self.get_function(uri, name.clone(), false).await.is_some() {
+                continue;
+            }
+            if self.is_builtin(&name).await {
+                continue;
+            }
+            out.push(Diagnostic {
+                range: Range {
+                    start: Self::byte_to_position(&src, callee.start_byte()),
+                    end: Self::byte_to_position(&src, callee.end_byte()),
+                },
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: Some(NumberOrString::String("unknown-function".to_string())),
+                source: Some("brenz".to_string()),
+                message: format!("unknown function '{name}'"),
+                related_information: None,
+                tags: None,
+                code_description: None,
+                data: None,
+            });
+        }
+
+        out
+    }
+
+    async fn is_builtin(&self, name: &str) -> bool {
+        let key = name.to_lowercase();
+        let b = self.builtins_doc.lock().await;
+        b.functions.contains_key(&key) || b.methods.contains_key(&key)
+    }
+
+    async fn check_foreign_fn(&self, node: Node<'_>, src: &str, out: &mut Vec<Diagnostic>) {
+        let Some((path, script, func)) = self.process_foreign_fn(node, src) else {
+            return;
+        };
+        let script_node = node.child_by_field_name("script").unwrap();
+        let func_node = node.child_by_field_name("function").unwrap();
+        let display = match &path {
+            Some(p) => format!("{}\\{script}", p.strip_suffix('\\').unwrap_or(p)),
+            None => script.clone(),
+        };
+        let Some(target) = self.ensure_script_loaded(path.as_deref(), &script).await else {
+            out.push(Self::script_diag(
+                src,
+                &script_node,
+                DiagnosticSeverity::WARNING,
+                "unknown-script",
+                format!("unknown script '{display}'"),
+            ));
+            return;
+        };
+        if self.get_function(&target, func.clone(), false).await.is_some() {
+            return;
+        }
+        // Only blame the target when it parsed cleanly; error recovery
+        // leaves definition lists partial.
+        let clean = self
+            .trees
+            .lock()
+            .await
+            .get(&target)
+            .is_some_and(|t| !t.root_node().has_error());
+        if clean {
+            out.push(Self::script_diag(
+                src,
+                &func_node,
+                DiagnosticSeverity::ERROR,
+                "unknown-function",
+                format!("function '{func}' not found in '{display}'"),
+            ));
+        }
+    }
+
+    fn script_diag(
+        src: &str,
+        node: &Node,
+        severity: DiagnosticSeverity,
+        code: &str,
+        message: String,
+    ) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: Self::byte_to_position(src, node.start_byte()),
+                end: Self::byte_to_position(src, node.end_byte()),
+            },
+            severity: Some(severity),
+            code: Some(NumberOrString::String(code.to_string())),
+            source: Some("brenz".to_string()),
+            message,
+            related_information: None,
+            tags: None,
+            code_description: None,
+            data: None,
+        }
+    }
+}

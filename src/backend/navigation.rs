@@ -185,7 +185,7 @@ impl Backend {
     ///
     /// Returns the URI the script is stored under. Works iteratively with
     /// an explicit queue, so dependency cycles terminate.
-    async fn ensure_script_loaded(&self, path: Option<&str>, script: &str) -> Option<Uri>
+    pub(crate) async fn ensure_script_loaded(&self, path: Option<&str>, script: &str) -> Option<Uri>
     {
         let mut visited: HashSet<Uri> = HashSet::new();
         let mut target: Option<Uri> = None;

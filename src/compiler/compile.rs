@@ -15,10 +15,10 @@
 //! - Reading an undeclared variable yields `undefined` (which is why
 //!   `isdefined` exists), it never traps.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::collections::HashMap;
 use tree_sitter::Node;
 
+use super::builtin;
 use super::op::{Instr, Op, Operand};
 use super::ScriptError;
 
@@ -44,19 +44,10 @@ pub(crate) fn compile(tree: &tree_sitter::Tree, src: &str) -> Result<Program, Ve
     Compiler::new(src).compile_program(tree)
 }
 
-/// Lowercase names of builtin methods (from `builtins.ron`), used to
-/// tell engine method calls apart from local `obj method()` calls.
-fn builtin_method_names() -> &'static HashSet<String> {
-    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
-    NAMES.get_or_init(|| {
-        #[derive(serde::Deserialize)]
-        struct Builtins {
-            methods: HashMap<String, serde::de::IgnoredAny>,
-        }
-        let m: Builtins =
-            ron::from_str(include_str!("../assets/builtins.ron")).expect("builtins.ron");
-        m.methods.into_keys().collect()
-    })
+/// Engine method calls need a game; anything else called on an object
+/// is a local `obj method()` call. Names come from `builtins.ron`.
+fn is_builtin_method(name: &str) -> bool {
+    builtin::is_engine_method(name)
 }
 
 struct LoopCtx {
@@ -1351,6 +1342,21 @@ impl<'a> Compiler<'a> {
         } else {
             // Builtin (pure or engine), or a function from another file:
             // resolved at runtime so the file still compiles standalone.
+            // Arity is checked only when the engine provably enforces it.
+            if let Some((min, max)) = builtin::arity(&name) {
+                let bad = argc < min || max.is_some_and(|m| argc > m);
+                if bad {
+                    let expected = match max {
+                        Some(m) if m == min => format!("{min} parameters"),
+                        Some(m) => format!("{min} to {m} parameters"),
+                        None => format!("at least {min} parameters"),
+                    };
+                    self.fail(
+                        &callee,
+                        format!("{name} expects {expected}, got {argc}"),
+                    );
+                }
+            }
             self.emit(Op::BuiltinFunction, Operand::FuncCall { name, argc }, node);
         }
     }
@@ -1403,7 +1409,7 @@ impl<'a> Compiler<'a> {
             self.emit_simple(Op::GetUndefined, node);
             return;
         };
-        if builtin_method_names().contains(&method_name) {
+        if is_builtin_method(&method_name) {
             self.emit(
                 Op::NeedGame,
                 Operand::Name(format!("builtin method {method_name} needs a game attached")),

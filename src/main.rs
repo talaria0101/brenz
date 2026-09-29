@@ -101,24 +101,11 @@ impl LanguageServer for Backend {
         self.client.log_message(MessageType::INFO,format!("Opened: {}", params.text_document.uri.as_str())).await;
 
         // Parse the newly opened document
-        let checker = self.checker.clone();
-        let parser = self.parser.clone();
-        let trees = self.trees.clone();
-        let fn_defs = self.fn_defs.clone();
-        let sym_defs = self.sym_defs.clone();
-        let client = self.client.clone();
-        Self::parse_and_diagnose(
+        self.docs_content.lock().await.insert(params.text_document.uri.clone(), params.text_document.text.clone());
+        self.parse_and_diagnose(
             params.text_document.uri.clone(),
             &params.text_document.text,
-            checker,
-            parser,
-            trees,
-            fn_defs,
-            sym_defs,
-            client
         ).await;
-
-        self.docs_content.lock().await.insert(params.text_document.uri, params.text_document.text);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams)
@@ -134,12 +121,7 @@ impl LanguageServer for Backend {
             self.docs_content.lock().await.insert(params.text_document.uri, change.text.clone());
             self.last_edit_time.lock().await.insert(uri.clone(), now);
 
-            let checker = self.checker.clone();
-            let parser = self.parser.clone();
-            let trees = self.trees.clone();
-            let fn_defs = self.fn_defs.clone();
-            let sym_defs = self.sym_defs.clone();
-            let client = self.client.clone();
+            let this = self.clone();
             let last_edit = self.last_edit_time.clone();
 
             tokio::spawn(async move {
@@ -148,16 +130,7 @@ impl LanguageServer for Backend {
 
                 let last = last_edit.lock().await.get(&uri).copied();
                 if last == Some(now) {
-                    Self::parse_and_diagnose(
-                        uri.clone(),
-                        &text,
-                        checker,
-                        parser,
-                        trees,
-                        fn_defs,
-                        sym_defs,
-                        client
-                    ).await;
+                    this.parse_and_diagnose(uri.clone(), &text).await;
                 }
             });
         }
