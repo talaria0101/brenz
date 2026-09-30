@@ -17,23 +17,31 @@ Run Brenz with `--backtrace` argument to get a backtrace for errors.
 
 ## Configuration
 The `.brenz` file in your project root is a RON config. It currently
-holds one field:
+holds two fields:
 
 ```ron
-// Game installation directories to resolve scripts from `.pk3` archives.
+// `root` anchors workspace script lookups, e.g. `sv` below, so
+// `maps\mp\gametypes\tdm` finds `sv/maps/mp/gametypes/tdm.gsc`.
+// `include_paths` are extra search roots holding loose `.gsc`
+// files and `.pk3` archives, e.g.:
+// include_paths: ["/home/user/games/cod/main", "/home/user/games/cod/uo"],
 (
-    game_paths: ["/home/user/games/cod"],
+    root: Some("sv"),
+    include_paths: [],
 )
 ```
 
 When a script references another script (e.g. `maps\mp\_utility::foo`)
-that is not in the workspace, Brenz scans the `.pk3` files in each
-`game_paths` directory for it. Matching inside archives is
-case-insensitive. If several archives hold the same script, files from
-later defined game paths are used, then later archive file names within
-one path (so `pak1.pk3` overrides `pak0.pk3`). A found script is parsed
-too, so its own dependencies resolve as well. Go-to-definition on such scripts points at
-`pk3://...` locations backed by the archive contents.
+that is not under `root`, Brenz searches each `include_paths`
+directory for it: loose `.gsc` files (found recursively) and the
+`.pk3` files inside (top level only). Matching is case-insensitive.
+Workspace files always win over includes; among includes, later
+defined paths win, then archives over loose files within one path
+(the game loads packed files first), then later file names. A found
+script is parsed too, so its own dependencies resolve as well.
+Go-to-definition on archive scripts points at `pk3://...` locations
+backed by the archive contents, while loose files point at their
+real path.
 
 The archive listing is cached in `.cache/brenz/pk3_index.ron` inside the
 project (clangd style) and refreshed automatically: only new, removed or

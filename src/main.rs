@@ -13,7 +13,7 @@ mod config;
 mod util;
 use util::{LogType, logprint};
 mod doc;
-mod pk3;
+mod include;
 
 impl LanguageServer for Backend {
     async fn initialize(
@@ -75,22 +75,26 @@ impl LanguageServer for Backend {
             .unwrap_or(false);
         *self.snippet_support.lock().await = snippet;
 
-        // Load the `.brenz` project config, then (re)build the `.pk3`
-        // index for the configured game paths. Only the central
-        // directory of each archive is read, so this stays fast.
+        // Load the `.brenz` project config, then (re)build the
+        // include index for the configured paths. Only listings are
+        // read (archive central directories, directory walks), never
+        // file contents, so this stays fast.
         let root = self.workspace_root.lock().await.clone();
         let cfg = crate::config::BrenzConfig::load(root.as_ref());
-        if !cfg.pk3_paths.is_empty() {
+        if cfg.root.is_some() || !cfg.include_paths.is_empty() {
             self.client
                 .log_message(
                     MessageType::INFO,
-                    format!("Brenz: pk3 paths: {:?}", cfg.pk3_paths),
+                    format!(
+                        "Brenz: root: {:?}, include paths: {:?}",
+                        cfg.root, cfg.include_paths
+                    ),
                 )
                 .await;
         }
-        let index = crate::pk3::Pk3Index::load_or_build(root.as_ref(), &cfg.pk3_paths);
+        let index = crate::include::IncludeIndex::load_or_build(root.as_ref(), &cfg.include_paths);
         *self.config.lock().await = cfg;
-        *self.pk3_index.lock().await = index;
+        *self.include_index.lock().await = index;
 
         logprint!(LogType::Info, "Brenz initializing");
         Ok(InitializeResult {

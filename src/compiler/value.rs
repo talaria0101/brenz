@@ -16,6 +16,14 @@ use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
+/// The two namespaces of one engine array: integer slots plus
+/// string keys. Missing reads in either give `undefined`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct ArrayData {
+    pub items: Vec<Value>,
+    pub keys: HashMap<String, Value>,
+}
+
 /// A runtime script value.
 #[derive(Debug, Clone, Default)]
 pub(crate) enum Value {
@@ -28,7 +36,9 @@ pub(crate) enum Value {
     IStr(String),
     Vec3([f32; 3]),
     /// Engine arrays are reference objects: assignment aliases.
-    Array(Rc<RefCell<Vec<Value>>>),
+    /// Integer slots and string keys live side by side, like
+    /// `a[0]` next to `game["allies"]`.
+    Array(Rc<RefCell<ArrayData>>),
     /// `spawnstruct` objects and field bags. Missing fields read
     /// as `undefined`, like the engine.
     Struct(Rc<RefCell<HashMap<String, Value>>>),
@@ -279,10 +289,11 @@ impl Value {
         })
     }
 
-    /// `size`, like `GetSizeValue`: arrays count, strings byte length.
+    /// `size`, like `GetSizeValue`: integer slots count, strings
+    /// byte length.
     pub(crate) fn size(&self) -> Result<i32, String> {
         match self {
-            Value::Array(items) => Ok(items.borrow().len() as i32),
+            Value::Array(items) => Ok(items.borrow().items.len() as i32),
             Value::Str(s) => Ok(s.len() as i32),
             v => Err(format!("size cannot be applied to {}", v.type_name())),
         }
@@ -309,12 +320,25 @@ impl Value {
             Value::Str(s) | Value::IStr(s) => write!(f, "{s}"),
             Value::Vec3(v) => write!(f, "{}", fmt_vec(v)),
             Value::Array(items) => {
+                let items = items.borrow();
                 write!(f, "[")?;
-                for (i, item) in items.borrow().iter().enumerate() {
-                    if i > 0 {
+                let mut first = true;
+                for item in items.items.iter() {
+                    if !first {
                         write!(f, ", ")?;
                     }
+                    first = false;
                     item.fmt_depth(f, depth + 1)?;
+                }
+                let mut keys: Vec<&String> = items.keys.keys().collect();
+                keys.sort();
+                for k in keys {
+                    if !first {
+                        write!(f, ", ")?;
+                    }
+                    first = false;
+                    write!(f, "{k}: ")?;
+                    items.keys[k].fmt_depth(f, depth + 1)?;
                 }
                 write!(f, "]")
             }
@@ -455,9 +479,9 @@ mod tests {
 
     #[test]
     fn cyclic_values_terminate() {
-        let arr = Value::Array(Rc::new(RefCell::new(Vec::new())));
+        let arr = Value::Array(Rc::new(RefCell::new(ArrayData::default())));
         if let Value::Array(items) = &arr {
-            items.borrow_mut().push(arr.clone());
+            items.borrow_mut().items.push(arr.clone());
         }
         let s = format!("{arr}");
         assert!(s.contains("..."), "{s}");

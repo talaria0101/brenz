@@ -1,20 +1,21 @@
 //! Code navigation related methods for Backend
 
 use super::Backend;
-use crate::pk3::Pk3Entry;
+use crate::include::IncludeEntry;
 use crate::util;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use tower_lsp::UriExt;
 use tower_lsp::lsp_types::*;
 use tower_lsp_server as tower_lsp;
 use tree_sitter::Node;
 use util::{LogType, logprint};
 
-/// URI scheme for scripts loaded from `.pk3` archives.
-///
-/// The path embeds the absolute archive path plus the member path, e.g.
+/// URI scheme for archive members. The path embeds the absolute
+/// archive path plus the member path, e.g.
 /// `pk3:///games/cod/main/pak0.pk3/maps/mp/gametypes/dm.gsc`, so every
 /// script has a unique, debuggable identity without extracting copies.
+/// Loose files keep plain file URIs, which clients can open directly.
 const PK3_URI_SCHEME: &str = "pk3";
 
 /// Percent-encode a URI path, keeping `/` and `:` (drive letters) intact.
@@ -30,20 +31,26 @@ fn encode_uri_path(s: &str) -> String {
     out
 }
 
-fn pk3_uri_for(entry: &Pk3Entry) -> Option<Uri> {
-    // Builds the `pk3://` identity for a script: archive path plus
-    // member path, special characters escaped. Returns `None` only
-    // for non-UTF-8 archive paths, which cannot live in a URI.
-    let pk3 = entry.pk3_path.to_str()?;
-    let inner = entry.inner_path.replace('\\', "/");
-    format!(
-        "{}://{}/{}",
-        PK3_URI_SCHEME,
-        encode_uri_path(pk3),
-        encode_uri_path(&inner)
-    )
-    .parse::<Uri>()
-    .ok()
+fn script_uri_for(entry: &IncludeEntry) -> Option<Uri> {
+    // Builds the identity URI for an indexed script: `pk3://` for
+    // archive members (archive path plus member path, escaped), or
+    // a plain file URI for loose files. Returns `None` only for
+    // non-UTF-8 archive paths, which cannot live in a URI.
+    match &entry.source {
+        crate::include::ScriptSource::Archive { pk3, inner } => {
+            let pk3 = pk3.to_str()?;
+            let inner = inner.replace('\\', "/");
+            format!(
+                "{}://{}/{}",
+                PK3_URI_SCHEME,
+                encode_uri_path(pk3),
+                encode_uri_path(&inner)
+            )
+            .parse::<Uri>()
+            .ok()
+        }
+        crate::include::ScriptSource::Loose { path } => Uri::from_file_path(path),
+    }
 }
 
 impl Backend {
@@ -217,11 +224,25 @@ impl Backend {
         target
     }
 
+    /// The base for workspace script lookups: the configured `root`
+    /// when set (relative to the workspace), else the workspace
+    /// itself. Workspace files always win over include lookups.
+    pub(crate) async fn script_root(&self) -> Option<PathBuf> {
+        let workspace = self.workspace_root.lock().await.clone();
+        let cfg = self.config.lock().await;
+        match &cfg.root {
+            Some(r) if r.is_absolute() => Some(r.clone()),
+            Some(r) => workspace.as_ref().map(|w| w.join(r)),
+            None => workspace,
+        }
+    }
+
     /// Load one script if needed and return its URI: a workspace file is
     /// read from disk when it has not been opened yet, otherwise the
-    /// `.pk3` index is searched case-insensitively.
+    /// include index (loose files, then `.pk3` archives) is searched
+    /// case-insensitively.
     async fn load_one_script(&self, path: Option<&str>, script: &str) -> Option<Uri> {
-        let root = self.workspace_root.lock().await.clone();
+        let root = self.script_root().await;
         if let Ok(abs) =
             util::resolove_scr_path(&root, path.map(str::to_string), script.to_string())
             && abs.is_file()
@@ -235,10 +256,10 @@ impl Backend {
                     return Some(uri);
                 }
                 Err(e) => {
-                    // Fall through to the `.pk3` lookup below.
+                    // Fall through to the include lookup below.
                     logprint!(
                         LogType::Error,
-                        "Couldn't read {}: {e}, trying .pk3 archives",
+                        "Couldn't read {}: {e}, trying include paths",
                         abs.display()
                     );
                 }
@@ -246,32 +267,22 @@ impl Backend {
         }
 
         let entry = self
-            .pk3_index
+            .include_index
             .lock()
             .await
             .lookup(path, script)
             .into_iter()
             .next()?;
-        let uri = pk3_uri_for(&entry)?;
+        let uri = script_uri_for(&entry)?;
         if !self.fn_defs.lock().await.contains_key(&uri) {
-            let text = match self.pk3_index.lock().await.read_script_text(&entry) {
+            let text = match self.include_index.lock().await.read_script_text(&entry) {
                 Ok(t) => t,
                 Err(e) => {
-                    logprint!(
-                        LogType::Error,
-                        "Couldn't read {} from {}: {e}",
-                        entry.inner_path,
-                        entry.pk3_path.display()
-                    );
+                    logprint!(LogType::Error, "Couldn't read {}: {e}", entry.display());
                     return None;
                 }
             };
-            logprint!(
-                LogType::Info,
-                "Loaded {} from {}",
-                entry.inner_path,
-                entry.pk3_path.display()
-            );
+            logprint!(LogType::Info, "Loaded {}", entry.display());
             if !self.parse_and_store(uri.clone(), &text).await {
                 return None;
             }
@@ -403,19 +414,30 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn entry(pk3: &str, inner: &str) -> Pk3Entry {
-        Pk3Entry {
-            pk3_path: PathBuf::from(pk3),
-            inner_path: inner.to_string(),
+    fn entry(pk3: &str, inner: &str) -> IncludeEntry {
+        IncludeEntry {
+            source: crate::include::ScriptSource::Archive {
+                pk3: PathBuf::from(pk3),
+                inner: inner.to_string(),
+            },
+            dir_order: 0,
+        }
+    }
+
+    fn loose_entry(path: &str) -> IncludeEntry {
+        IncludeEntry {
+            source: crate::include::ScriptSource::Loose {
+                path: PathBuf::from(path),
+            },
             dir_order: 0,
         }
     }
 
     #[test]
     fn pk3_uris_parse_and_stay_unique() {
-        let a = pk3_uri_for(&entry("/games/cod/main/pak0.pk3", "maps/mp/dm.gsc")).unwrap();
-        let b = pk3_uri_for(&entry("/games/cod/main/pak1.pk3", "maps/mp/dm.gsc")).unwrap();
-        let c = pk3_uri_for(&entry("/games/cod/main/pak0.pk3", "maps\\MP\\DM.GSC")).unwrap();
+        let a = script_uri_for(&entry("/games/cod/main/pak0.pk3", "maps/mp/dm.gsc")).unwrap();
+        let b = script_uri_for(&entry("/games/cod/main/pak1.pk3", "maps/mp/dm.gsc")).unwrap();
+        let c = script_uri_for(&entry("/games/cod/main/pak0.pk3", "maps\\MP\\DM.GSC")).unwrap();
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert!(a.as_str().starts_with("pk3:///games/cod/main/pak0.pk3/"));
@@ -423,7 +445,13 @@ mod tests {
 
     #[test]
     fn pk3_uris_encode_spaces() {
-        let u = pk3_uri_for(&entry("/games/my game/pak0.pk3", "maps/mp/a b.gsc")).unwrap();
+        let u = script_uri_for(&entry("/games/my game/pak0.pk3", "maps/mp/a b.gsc")).unwrap();
         assert!(u.as_str().contains("%20"));
+    }
+
+    #[test]
+    fn loose_files_get_file_uris() {
+        let u = script_uri_for(&loose_entry("/games/cod/maps/mp/dm.gsc")).unwrap();
+        assert_eq!(u.as_str(), "file:///games/cod/maps/mp/dm.gsc");
     }
 }

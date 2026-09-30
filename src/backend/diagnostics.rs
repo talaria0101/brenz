@@ -252,7 +252,7 @@ impl Backend {
         let mut body = None;
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if !child.is_named() {
+            if !child.is_named() || child.kind() == "comment" {
                 continue;
             }
             if child.id() == needle.id() || child.id() == hay.id() {

@@ -67,7 +67,7 @@ pub(crate) fn scope_vars(tree: &Tree, src: &str, byte: usize) -> Vec<ScopeVar> {
                     let mut val = None;
                     let mut cursor = node.walk();
                     for child in node.children(&mut cursor) {
-                        if !child.is_named() {
+                        if !child.is_named() || child.kind() == "comment" {
                             continue;
                         }
                         if child.kind() == "identifier" && name.is_none() {
@@ -111,7 +111,7 @@ pub(crate) fn scope_vars(tree: &Tree, src: &str, byte: usize) -> Vec<ScopeVar> {
             let mut val = None;
             let mut inner = child.walk();
             for c in child.children(&mut inner) {
-                if !c.is_named() {
+                if !c.is_named() || c.kind() == "comment" {
                     continue;
                 }
                 if c.kind() == "identifier" && name.is_none() {
@@ -201,18 +201,32 @@ fn sig_return(returns: &Option<GscType>) -> Option<GscType> {
 
 fn strip(mut node: Node) -> Node {
     // Single-child wrappers the grammar leaves behind: an expression
-    // in expression in call in call. Stops at real nodes, which
-    // always carry two or more children (or none).
+    // in expression in call in call. Comments do not count as
+    // children here, or wrappers with trailing comments unpeel.
+    // Stops at real nodes, which always carry two or more children
+    // (or none).
     loop {
         let kind = node.kind();
         if (kind == "expression" || kind == "vec1" || kind == "call_expression")
-            && node.named_child_count() == 1
+            && code_children(&node).len() == 1
         {
-            node = node.named_child(0).unwrap();
+            node = code_children(&node).into_iter().next().unwrap();
             continue;
         }
         return node;
     }
+}
+
+/// Named children minus comments, which turn up inline everywhere.
+fn code_children<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.is_named() && child.kind() != "comment" {
+            out.push(child);
+        }
+    }
+    out
 }
 
 fn slice(src: &str, node: &Node) -> String {
@@ -309,10 +323,11 @@ pub(crate) fn enclosing_call(tree: &Tree, src: &str, byte: usize) -> Option<(Str
 /// Zero-based argument index at `byte`: expressions fully before the
 /// cursor count, so a trailing comma selects the next slot.
 fn arg_index_at(list: &Node, _src: &str, byte: usize) -> usize {
+    // Comments between arguments do not count as arguments.
     let mut index = 0;
     let mut cursor = list.walk();
     for child in list.children(&mut cursor) {
-        if !child.is_named() {
+        if !child.is_named() || child.kind() == "comment" {
             continue;
         }
         if child.start_byte() > byte {

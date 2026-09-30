@@ -156,6 +156,34 @@ mod tests {
     }
 
     #[test]
+    fn string_keyed_arrays() {
+        let out = run_src(
+            "main()\n{\n\ta = [];\n\ta[\"allies\"] = \"american\";\n\ta[0] = 1;\n\treturn a[\"allies\"];\n}\n",
+        )
+        .unwrap();
+        assert_eq!(out.value, value::Value::Str("american".into()));
+    }
+
+    #[test]
+    fn member_postfix() {
+        // `obj.field++` yields old, stores new; game objects still
+        // compile (they fail only if executed without a game).
+        let out = run_src(
+            "main()\n{\n\ts = spawnstruct();\n\ts.score = 10;\n\tx = s.score++;\n\ts.score--;\n\treturn x + s.score;\n}\n",
+        )
+        .unwrap();
+        assert_eq!(out.value, value::Value::Int(20));
+    }
+
+    #[test]
+    fn declared_strings_stay_neutral() {
+        // A declared string return must never poison its context:
+        // the runtime value decides, not the stand-in.
+        check_ok("main()\n{\n\tif ( getcvar( \"x\" ) )\n\t\treturn 1;\n\treturn 0;\n}\n");
+        check_ok("main()\n{\n\tx = getcvar( \"x\" ) + \"!\";\n\treturn x;\n}\n");
+    }
+
+    #[test]
     fn pointers_and_methods() {
         let out = run_src(
             "add( a, b )\n{\n\treturn a + b;\n}\nrun( f )\n{\n\treturn [[f]]( 20, 22 );\n}\napply( o, f )\n{\n\treturn o run( f );\n}\nmain()\n{\n\tf = ::add;\n\to = [];\n\treturn run( f ) + apply( o, f );\n}\n",
@@ -227,6 +255,13 @@ mod tests {
     }
 
     #[test]
+    fn comments_everywhere_stay_quiet() {
+        check_ok(
+            "main()\n{\n\t// leading\n\tx = 1 /* inline */ + 2; // sum\n\tfoo( 1 /* one */, 2 );\n\t/* block */\n}\n",
+        );
+    }
+
+    #[test]
     fn type_errors() {
         // Certain engine errors.
         check_err("main()\n{\n\tx = 1 + undefined;\n}\n", "unmatching types");
@@ -245,9 +280,10 @@ mod tests {
             "vector needs numbers",
         );
         check_err(
-            "main()\n{\n\ta = [];\n\tx = a[\"k\"];\n}\n",
-            "array index must be an integer",
+            "main()\n{\n\ta = [];\n\tx = a[( 1, 2, 3 )];\n}\n",
+            "array index must be an integer or string",
         );
+        check_ok("main()\n{\n\tgame[\"allies\"] = \"american\";\n}\n");
         check_err("main()\n{\n\tx = sin( \"abc\" );\n}\n", "expects float");
         check_err(
             "main()\n{\n\tx = distance( ( 0, 0, 0 ), 5 );\n}\n",

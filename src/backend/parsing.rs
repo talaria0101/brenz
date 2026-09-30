@@ -228,6 +228,14 @@ impl Backend {
 
     /// Some editors (including kate) might not show a red underline at EOL.
     /// So, we need to adjust the char range to underline.
+    /// First non-comment child: a stray comment in front must not
+    /// steal the function name slot.
+    fn first_code_child<'a>(node: &tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .find(|child| child.is_named() && child.kind() != "comment")
+    }
+
     fn adjust_range_for_visibility(
         source: &str,
         start: Position,
@@ -306,7 +314,7 @@ impl Backend {
         for child in root.children(&mut cursor) {
             // First child should be function name identifier
             if let Some(func_head) = child.child_by_field_name("func_head")
-                && let Some(name_node) = func_head.child(0)
+                && let Some(name_node) = Self::first_code_child(&func_head)
                 && name_node.kind() == "identifier"
             {
                 let name = &source[name_node.start_byte()..name_node.end_byte()];
@@ -398,7 +406,7 @@ impl Backend {
                 }
 
                 if let Some(func_head) = child.child_by_field_name("func_head")
-                    && let Some(name_node) = func_head.child(0)
+                    && let Some(name_node) = Self::first_code_child(&func_head)
                 {
                     let name = &src[name_node.start_byte()..name_node.end_byte()];
                     let detail = &src[func_head.start_byte()..func_head.end_byte()];

@@ -69,10 +69,13 @@ fn return_rep(t: &GscType) -> Option<Value> {
         Bool => Some(Value::Int(0)),
         Int => Some(Value::Int(0)),
         Float => Some(Value::Float(0.0)),
-        String => Some(Value::Str(::std::string::String::new())),
-        LString => Some(Value::IStr(::std::string::String::new())),
+        // "0" is the neutral string: it passes every cast, so a
+        // declared string never poisons a check by itself. Only the
+        // operation can still fail, which is exactly what is checked.
+        String => Some(Value::Str("0".to_string())),
+        LString => Some(Value::IStr("0".to_string())),
         Array => Some(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
-            Vec::new(),
+            super::value::ArrayData::default(),
         )))),
         Vector => Some(Value::Vec3([0.0; 3])),
         Entity => Some(Value::Entity),
@@ -245,9 +248,9 @@ impl<'a> Compiler<'a> {
         loop {
             let kind = node.kind();
             if (kind == "expression" || kind == "statement" || kind == "call_expression")
-                && node.named_child_count() == 1
+                && self.code_child_count(&node) == 1
             {
-                node = node.named_child(0).unwrap();
+                node = self.first_code_child(&node).unwrap();
                 continue;
             }
             return node;
@@ -257,14 +260,27 @@ impl<'a> Compiler<'a> {
     /// Named children only; anonymous tokens (braces, commas) are
     /// just punctuation and never carry meaning here.
     fn named_children(&self, node: &Node<'a>) -> Vec<Node<'a>> {
+        // Comments show up inline everywhere (operands, argument
+        // lists, bodies), and no pass ever wants them.
         let mut out = Vec::new();
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if child.is_named() {
+            if child.is_named() && child.kind() != "comment" {
                 out.push(child);
             }
         }
         out
+    }
+
+    /// First meaningful child: comments never count, so this is the
+    /// identifier even with stray comments in front.
+    fn first_code_child(&self, node: &Node<'a>) -> Option<Node<'a>> {
+        self.named_children(node).into_iter().next()
+    }
+
+    /// Count without comments, for spotting single-child wrappers.
+    fn code_child_count(&self, node: &Node<'a>) -> usize {
+        self.named_children(node).len()
     }
 
     fn compile_program(mut self, tree: &'a tree_sitter::Tree) -> Result<Program, Vec<ScriptError>> {
@@ -280,7 +296,7 @@ impl<'a> Compiler<'a> {
             let Some(head) = child.child_by_field_name("func_head") else {
                 continue;
             };
-            let Some(name_node) = head.named_child(0) else {
+            let Some(name_node) = self.first_code_child(&head) else {
                 continue;
             };
             let name = self.text(&name_node).to_lowercase();
@@ -301,7 +317,7 @@ impl<'a> Compiler<'a> {
                 // The engine rejects redefinition. Last body wins so
                 // later code still resolves, but it is reported.
                 if let Some(head) = node.child_by_field_name("func_head")
-                    && let Some(name_node) = head.named_child(0)
+                    && let Some(name_node) = self.first_code_child(&head)
                 {
                     self.fail(&name_node, format!("function '{name}' already defined"));
                 }
@@ -1204,7 +1220,7 @@ impl<'a> Compiler<'a> {
             "boolean" => Some(Value::Int(i32::from(self.text(&node) == "true"))),
             "undefined" => Some(Value::Undefined),
             "array" => Some(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
-                Vec::new(),
+                super::value::ArrayData::default(),
             )))),
             "vec1" => {
                 let mut out = None;
@@ -1245,16 +1261,16 @@ impl<'a> Compiler<'a> {
             }
             "binary_expression" => {
                 let (l, r) = self.binary_operands(&node)?;
-                let op = self.src[l.end_byte()..r.start_byte()].trim();
+                let op = self.op_text(l.end_byte(), r.start_byte());
                 let (Some(lv), Some(rv)) = (self.static_value(&l), self.static_value(&r)) else {
                     return None;
                 };
-                match op {
+                match op.as_str() {
                     "&&" | "||" => Some(Value::Int(0)),
                     "==" | "!=" => Value::equals(&lv, &rv)
                         .ok()
                         .map(|b| Value::Int(i32::from(b))),
-                    "<" | ">" | "<=" | ">=" => Value::compare(op, &lv, &rv)
+                    "<" | ">" | "<=" | ">=" => Value::compare(op.as_str(), &lv, &rv)
                         .ok()
                         .map(|b| Value::Int(i32::from(b))),
                     "+" | "-" | "*" | "/" | "%" => Value::arith(op.chars().next()?, &lv, &rv).ok(),
@@ -1270,9 +1286,9 @@ impl<'a> Compiler<'a> {
             }
             "unary_expression" => {
                 let inner = self.unary_inner(&node)?;
-                let op = self.src[node.start_byte()..inner.start_byte()].trim();
+                let op = self.op_text(node.start_byte(), inner.start_byte());
                 let v = self.static_value(&inner)?;
-                match op {
+                match op.as_str() {
                     "+" => Some(v),
                     "-" => match v {
                         Value::Int(i) => Some(Value::Int(i.wrapping_neg())),
@@ -1315,6 +1331,33 @@ impl<'a> Compiler<'a> {
             return t.parse::<f32>().ok().map(Value::Float);
         }
         t.parse::<i32>().ok().map(Value::Int)
+    }
+
+    /// Operator text between two offsets, with comments stripped.
+    /// Comments sit inline between operands (`a /* why */ + b`),
+    /// and matching raw text against operators would misfire on them.
+    fn op_text(&self, from: usize, to: usize) -> String {
+        let span = &self.src[from..to];
+        let mut out = String::with_capacity(span.len());
+        let bytes = span.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            } else if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                i += 2;
+                while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            } else {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        out.trim().to_string()
     }
 
     /// The two operand nodes of a binary expression.
@@ -1412,9 +1455,7 @@ impl<'a> Compiler<'a> {
         let rhs = self.peel(kids.pop().unwrap());
         let lhs = self.peel(kids.pop().unwrap());
         // Operator text sits between the operands.
-        let op = self.src[lhs.end_byte()..rhs.start_byte()]
-            .trim()
-            .to_string();
+        let op = self.op_text(lhs.end_byte(), rhs.start_byte());
         self.check_binary(&lhs, &rhs, &op, node);
         match op.as_str() {
             "&&" => {
@@ -1524,15 +1565,20 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Array indices must be integers; floats may truncate at runtime
-    /// and are left alone, everything else is certainly wrong.
+    /// Array indices are integers or strings: the engine supports
+    /// string-keyed arrays (`game["allies"]`), while vectors and
+    /// the rest are certainly wrong. Floats may truncate at runtime
+    /// and are left alone.
     fn check_index(&mut self, idx: &Node<'a>) {
         if let Some(v) = self.static_value(idx)
-            && !matches!(v, Value::Int(_) | Value::Float(_))
+            && !matches!(v, Value::Int(_) | Value::Float(_) | Value::Str(_))
         {
             self.fail(
                 idx,
-                format!("array index must be an integer, got {}", v.type_name()),
+                format!(
+                    "array index must be an integer or string, got {}",
+                    v.type_name()
+                ),
             );
         }
     }
@@ -1546,9 +1592,7 @@ impl<'a> Compiler<'a> {
             return;
         }
         let inner = self.peel(kids.pop().unwrap());
-        let op = self.src[node.start_byte()..inner.start_byte()]
-            .trim()
-            .to_string();
+        let op = self.op_text(node.start_byte(), inner.start_byte());
         if let Some(v) = self.static_value(&inner) {
             match op.as_str() {
                 "!" => self.check_truthy(&v, &inner),
@@ -1605,6 +1649,27 @@ impl<'a> Compiler<'a> {
                 self.emit_simple(op, node);
                 self.emit_store_resolved(&name, &r, node);
             }
+            // `obj.field++`: struct fields and game objects alike.
+            // The base evaluates once into a temp; game bases raise
+            // their boundary error when reached, like everywhere else.
+            "member_expression" => {
+                let Some((base, field)) = self.split_member(&target) else {
+                    return;
+                };
+                self.compile_expr(&base);
+                let t_b = self.temp_slot();
+                self.emit(Op::SetLocal, Operand::Slot(t_b), node);
+                self.emit(Op::GetLocal, Operand::Slot(t_b), node);
+                self.emit(Op::GetField, Operand::Name(field.clone()), node);
+                self.emit_simple(Op::Dup, node);
+                self.emit_simple(op, node);
+                let t_n = self.temp_slot();
+                self.emit(Op::SetLocal, Operand::Slot(t_n), node);
+                self.emit(Op::GetLocal, Operand::Slot(t_b), node);
+                self.emit(Op::GetLocal, Operand::Slot(t_n), node);
+                self.emit(Op::SetField, Operand::Name(field), node);
+                // The old value is already on top: postfix yields it.
+            }
             _ => {
                 // Complex target: evaluate the address once via temps.
                 let Some((base, idx)) = self.compile_addr(&target) else {
@@ -1638,9 +1703,7 @@ impl<'a> Compiler<'a> {
         };
         let var = self.peel(var);
         let val = self.peel(val);
-        let op = self.src[var.end_byte()..val.start_byte()]
-            .trim()
-            .to_string();
+        let op = self.op_text(var.end_byte(), val.start_byte());
         if op == "=" {
             self.compile_assign_value(&var, &val, node);
             return;

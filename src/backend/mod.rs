@@ -18,7 +18,7 @@ pub(crate) type FnDefs = HashMap<String, (Range, Option<String>)>;
 use crate::brace::BracketChecker;
 use crate::config::BrenzConfig;
 use crate::doc::Builtins;
-use crate::pk3::Pk3Index;
+use crate::include::IncludeIndex;
 
 #[derive(Clone)]
 pub struct Backend {
@@ -48,8 +48,8 @@ pub struct Backend {
     pub builtins_doc: Arc<Mutex<Builtins>>,
     /// Parsed `.brenz` project configuration
     pub config: Arc<Mutex<BrenzConfig>>,
-    /// Index of scripts inside `.pk3` archives from `game_paths`
-    pub pk3_index: Arc<Mutex<Pk3Index>>,
+    /// Index of scripts inside `.pk3` archives from `pk3_paths`
+    pub include_index: Arc<Mutex<IncludeIndex>>,
 }
 
 impl Debug for Backend {
@@ -84,7 +84,7 @@ impl Backend {
             docs_content: Arc::new(Mutex::new(HashMap::new())),
             builtins_doc: Arc::new(Mutex::new(Builtins::new())),
             config: Arc::new(Mutex::new(BrenzConfig::default())),
-            pk3_index: Arc::new(Mutex::new(Pk3Index::default())),
+            include_index: Arc::new(Mutex::new(IncludeIndex::default())),
         };
         /*
                 let backend_ref = Arc::new(backend);

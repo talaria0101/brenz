@@ -16,7 +16,7 @@ use std::rc::Rc;
 use super::builtin::{self, BuiltinError, Rng};
 use super::compile::Program;
 use super::op::{Op, Operand};
-use super::value::Value;
+use super::value::{ArrayData, Value};
 
 /// Maximum call depth, like `SCRIPT_INTERPRETER_MAX_CALL_DEPTH`.
 pub(crate) const MAX_CALL_DEPTH: usize = 32;
@@ -251,24 +251,28 @@ impl<'a> Vm<'a> {
                 }
                 Op::NewArray => self
                     .stack
-                    .push(Value::Array(Rc::new(RefCell::new(Vec::new())))),
+                    .push(Value::Array(Rc::new(RefCell::new(ArrayData::default())))),
                 Op::GetIndex => {
                     let index = self.pop(pos)?;
                     let base = self.pop(pos)?;
                     let Value::Array(items) = base else {
                         return Err(fail(format!("cannot index {}", base.type_name())));
                     };
-                    let Value::Int(i) = index else {
-                        return Err(fail("array index must be an integer".to_string()));
-                    };
-                    let v = if i < 0 {
-                        Value::Undefined
-                    } else {
-                        items
-                            .borrow()
+                    let items = items.borrow();
+                    let v = match index {
+                        Value::Int(i) if i >= 0 => items
+                            .items
                             .get(i as usize)
                             .cloned()
-                            .unwrap_or(Value::Undefined)
+                            .unwrap_or(Value::Undefined),
+                        Value::Str(k) => items.keys.get(&k).cloned().unwrap_or(Value::Undefined),
+                        Value::Int(_) => Value::Undefined,
+                        v => {
+                            return Err(fail(format!(
+                                "array index must be an integer or string, got {}",
+                                v.type_name()
+                            )));
+                        }
                     };
                     self.stack.push(v);
                 }
@@ -276,24 +280,30 @@ impl<'a> Vm<'a> {
                     let value = self.pop(pos)?;
                     let index = self.pop(pos)?;
                     let base = self.pop(pos)?;
-                    #[cfg(test)]
-                    if std::env::var("BRENZ_TRACE").is_ok() {
-                        eprintln!("SETINDEX value={value:?} index={index:?} base={base:?}");
-                    }
                     let Value::Array(items) = base else {
                         return Err(fail(format!("cannot index {}", base.type_name())));
                     };
-                    let Value::Int(i) = index else {
-                        return Err(fail("array index must be an integer".to_string()));
-                    };
-                    if i < 0 {
-                        return Err(fail("negative array index".to_string()));
-                    }
                     let mut items = items.borrow_mut();
-                    if items.len() <= i as usize {
-                        items.resize(i as usize + 1, Value::Undefined);
+                    match index {
+                        Value::Int(i) if i >= 0 => {
+                            if items.items.len() <= i as usize {
+                                items.items.resize(i as usize + 1, Value::Undefined);
+                            }
+                            items.items[i as usize] = value;
+                        }
+                        Value::Str(k) => {
+                            items.keys.insert(k, value);
+                        }
+                        Value::Int(_) => {
+                            return Err(fail("negative array index".to_string()));
+                        }
+                        v => {
+                            return Err(fail(format!(
+                                "array index must be an integer or string, got {}",
+                                v.type_name()
+                            )));
+                        }
                     }
-                    items[i as usize] = value;
                 }
                 Op::GetField => {
                     let Operand::Name(field) = instr.arg else {
@@ -311,7 +321,7 @@ impl<'a> Vm<'a> {
                         }
                         // Idiomatic `a.size`, like the engine's field.
                         Value::Array(items) if field == "size" => {
-                            let n = items.borrow().len() as i32;
+                            let n = items.borrow().items.len() as i32;
                             self.stack.push(Value::Int(n));
                         }
                         v => return Err(fail(format!("cannot read field of {}", v.type_name()))),

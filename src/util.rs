@@ -103,9 +103,8 @@ pub(crate) fn get_data_dir() -> io::Result<PathBuf> {
 }
 
 pub fn ron_pcfg() -> &'static PrettyConfig {
-    static PC: LazyLock<PrettyConfig> = LazyLock::new(|| {
-        PrettyConfig::new().indentor("  ".to_owned())
-    });
+    static PC: LazyLock<PrettyConfig> =
+        LazyLock::new(|| PrettyConfig::new().indentor("  ".to_owned()));
 
     &PC
 }
