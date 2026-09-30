@@ -79,6 +79,37 @@ impl Backend {
         Position { line, character }
     }
 
+    /// Byte offset where every line starts, for position lookups that
+    /// run thousands of times per file. Build once per source, then
+    /// convert with `byte_to_position_fast` below.
+    pub(crate) fn line_starts(source: &str) -> Vec<usize> {
+        let mut starts = vec![0];
+        for (i, ch) in source.char_indices() {
+            if ch == '\n' {
+                starts.push(i + 1);
+            }
+        }
+        starts
+    }
+
+    /// Same result as `byte_to_position`, but O(log lines plus line
+    /// length) over a precomputed `line_starts` table instead of
+    /// rescanning the file from byte zero on every call. Offsets past
+    /// the end clamp to the end, like the slow path effectively does.
+    pub(crate) fn byte_to_position_fast(
+        starts: &[usize],
+        source: &str,
+        byte_offset: usize,
+    ) -> Position {
+        let off = byte_offset.min(source.len());
+        let line = starts.partition_point(|&s| s <= off).saturating_sub(1);
+        let character = source[starts[line]..off].chars().count() as u32;
+        Position {
+            line: line as u32,
+            character,
+        }
+    }
+
     pub(crate) fn position_to_byte(source: &str, position: Position) -> usize {
         let mut byte_offset = 0;
         let mut current_line = 0;

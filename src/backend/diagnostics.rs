@@ -17,6 +17,9 @@ impl Backend {
     /// Project-aware checks for one open document: unknown calls and
     /// unresolvable foreign references. Only runs on clean parses so
     /// half-broken trees never produce noise.
+    // `Uri` carries interior mutability but is never mutated in place
+    // here; it is only ever an immutable visited marker.
+    #[allow(clippy::mutable_key_type)]
     pub(crate) async fn script_diagnostics(&self, uri: &Uri) -> Vec<Diagnostic> {
         let diag_start = std::time::Instant::now();
         let (tree, src) = {
@@ -41,8 +44,14 @@ impl Backend {
         Self::find_descendants_of_kind(root, "foreign_function_ptr", &mut foreigns);
         let foreign_total = foreigns.len();
         let t = std::time::Instant::now();
+        // One visited set for the whole pass: closures overlap heavily
+        // (every gametype pulls the same utilities), so a fresh set per
+        // reference re-walks the same transitive deps dozens of times.
+        // The log showed 76 `ensure_script_loaded` calls for 57 refs.
+        let mut loaded: std::collections::HashSet<Uri> = std::collections::HashSet::new();
         for node in foreigns {
-            self.check_foreign_fn(node, &src, &mut out).await;
+            self.check_foreign_fn(node, &src, &mut out, &mut loaded)
+                .await;
         }
         let foreign_ms = crate::util::timing_ms(t);
 
@@ -114,8 +123,18 @@ impl Backend {
 
     /// Check one foreign reference: resolve the script (warning when
     /// it exists nowhere), then the function inside it (error when the
-    /// target parsed cleanly but lacks it).
-    async fn check_foreign_fn(&self, node: Node<'_>, src: &str, out: &mut Vec<Diagnostic>) {
+    /// target parsed cleanly but lacks it). `visited` is the calling
+    /// pass's shared set, so overlapping closures load once.
+    // `Uri` carries interior mutability but is never mutated in place
+    // here; it is only ever an immutable visited marker.
+    #[allow(clippy::mutable_key_type)]
+    async fn check_foreign_fn(
+        &self,
+        node: Node<'_>,
+        src: &str,
+        out: &mut Vec<Diagnostic>,
+        visited: &mut std::collections::HashSet<Uri>,
+    ) {
         let Some((path, script, func)) = self.process_foreign_fn(node, src) else {
             return;
         };
@@ -126,7 +145,9 @@ impl Backend {
             None => script.clone(),
         };
         let t = std::time::Instant::now();
-        let loaded = self.ensure_script_loaded(path.as_deref(), &script).await;
+        let loaded = self
+            .ensure_script_loaded_shared(path.as_deref(), &script, visited)
+            .await;
         let load_ms = crate::util::timing_ms(t);
         // Per-reference load time: a single slow archive read shows up
         // here, while the totals land in ensure_script_loaded.

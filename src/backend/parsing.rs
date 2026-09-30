@@ -4,7 +4,7 @@ use crate::compiler::compile::compile as compile_gsc;
 use crate::util::{LogType, logprint};
 
 use super::Backend;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tower_lsp::lsp_types::*;
 use tower_lsp_server as tower_lsp;
 use tree_sitter::Tree;
@@ -420,6 +420,9 @@ impl Backend {
         let mut fns: super::FnDefs = HashMap::new();
         let root = tree.root_node();
         let mut cursor = root.walk();
+        // One line table for the whole file: positions below are
+        // O(log n) each instead of rescanning from byte zero.
+        let starts = Self::line_starts(source);
 
         for child in root.children(&mut cursor) {
             // First child should be function name identifier
@@ -429,8 +432,8 @@ impl Backend {
             {
                 let name = &source[name_node.start_byte()..name_node.end_byte()];
                 let range = Range {
-                    start: Self::byte_to_position(source, func_head.start_byte()),
-                    end: Self::byte_to_position(source, func_head.end_byte()),
+                    start: Self::byte_to_position_fast(&starts, source, func_head.start_byte()),
+                    end: Self::byte_to_position_fast(&starts, source, func_head.end_byte()),
                 };
 
                 let comment = match child.prev_sibling() {
@@ -444,14 +447,6 @@ impl Backend {
                     None => None,
                 };
 
-                logprint!(
-                    LogType::Info,
-                    "Name: {}, Function: {}, Comment: {:?}",
-                    name,
-                    &source[func_head.start_byte()..func_head.end_byte()],
-                    &comment.as_ref()
-                );
-
                 fns.insert(name.to_string(), (range, comment));
             }
         }
@@ -464,27 +459,33 @@ impl Backend {
         let mut symbols: Vec<DocumentSymbol> = Vec::new();
         let root = tree.root_node();
         let mut cursor = root.walk();
+        // One line table for the whole file: every range below is
+        // O(log n). The slow path rescans from byte zero per call,
+        // which is quadratic on files with thousands of writes and
+        // was the 6-minute open (36s on one 461KB waypoint file).
+        let starts = Self::line_starts(src);
 
         for child in root.children(&mut cursor) {
             if child.kind() == "function_definition" {
                 let mut vars: Vec<DocumentSymbol> = Vec::new();
 
                 if let Some(func_block) = child.child_by_field_name("func_block") {
-                    logprint!(LogType::Info, "in func_block");
                     let mut assign_exprs = Vec::new();
                     Self::find_descendants_of_kind(
                         func_block,
                         "assignment_expression",
                         &mut assign_exprs,
                     );
-                    logprint!(LogType::Info, "assign_exprs: {:#?}", assign_exprs.clone());
-                    let mut done: Vec<String> = Vec::new();
+                    // Borrowed set, no per-write allocation: the old
+                    // `Vec::contains` scan was quadratic in the number
+                    // of distinct variables.
+                    let mut done: HashSet<&str> = HashSet::new();
 
                     for expr in assign_exprs.into_iter() {
                         if let Some(var) = expr.child_by_field_name("variable") {
                             let var_name = &src[var.start_byte()..var.end_byte()];
                             // don't want dups in symbol tree
-                            if done.contains(&var_name.to_string()) {
+                            if !done.insert(var_name) {
                                 continue;
                             }
 
@@ -496,12 +497,20 @@ impl Backend {
                                 #[allow(deprecated)]
                                 deprecated: None,
                                 range: Range {
-                                    start: Self::byte_to_position(src, expr.start_byte()),
-                                    end: Self::byte_to_position(src, expr.end_byte()),
+                                    start: Self::byte_to_position_fast(
+                                        &starts,
+                                        src,
+                                        expr.start_byte(),
+                                    ),
+                                    end: Self::byte_to_position_fast(&starts, src, expr.end_byte()),
                                 },
                                 selection_range: Range {
-                                    start: Self::byte_to_position(src, var.start_byte()),
-                                    end: Self::byte_to_position(src, var.end_byte()),
+                                    start: Self::byte_to_position_fast(
+                                        &starts,
+                                        src,
+                                        var.start_byte(),
+                                    ),
+                                    end: Self::byte_to_position_fast(&starts, src, var.end_byte()),
                                 },
                                 children: None,
                             };
@@ -509,8 +518,6 @@ impl Backend {
                             //logprint!(LogType::Info, "Symbol: {:#?}", sym.clone());
 
                             vars.push(sym);
-
-                            done.push(var_name.to_string());
                         }
                     }
                 }
@@ -529,12 +536,16 @@ impl Backend {
                         #[allow(deprecated)]
                         deprecated: None, // screw it
                         range: Range {
-                            start: Self::byte_to_position(src, child.start_byte()),
-                            end: Self::byte_to_position(src, child.end_byte()),
+                            start: Self::byte_to_position_fast(&starts, src, child.start_byte()),
+                            end: Self::byte_to_position_fast(&starts, src, child.end_byte()),
                         },
                         selection_range: Range {
-                            start: Self::byte_to_position(src, func_head.start_byte()),
-                            end: Self::byte_to_position(src, func_head.end_byte()),
+                            start: Self::byte_to_position_fast(
+                                &starts,
+                                src,
+                                func_head.start_byte(),
+                            ),
+                            end: Self::byte_to_position_fast(&starts, src, func_head.end_byte()),
                         },
                         children: Some(vars),
                     });
@@ -545,3 +556,72 @@ impl Backend {
         symbols
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &str) -> tree_sitter::Tree {
+        let language = tree_sitter_gsc::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        parser.parse(src, None).unwrap()
+    }
+
+    #[test]
+    fn fast_positions_agree_with_slow_path() {
+        let src =
+            "main()\n{\n\tx = 1;\n\ts = \"héllo\";\n\ty = x + 1;\n}\nfoo()\n{\n\treturn 0;\n}\n";
+        let starts = Backend::line_starts(src);
+        let mut off = 0;
+        while off <= src.len() {
+            if !src.is_char_boundary(off) {
+                off += 1;
+                continue;
+            }
+            assert_eq!(
+                Backend::byte_to_position(src, off),
+                Backend::byte_to_position_fast(&starts, src, off),
+                "offset {off}"
+            );
+            off += 1;
+        }
+    }
+
+    #[test]
+    fn duplicate_writes_yield_one_variable_symbol() {
+        let src = "main()\n{\n\tx = 1;\n\tx = 2;\n\ty = x;\n\tx = 3;\n}\n";
+        let tree = parse(src);
+        let syms = Backend::extract_syms(&tree, src);
+        assert_eq!(syms.len(), 1);
+        let kids = syms[0].children.as_ref().unwrap();
+        assert_eq!(kids.len(), 2);
+        assert!(kids.iter().any(|v| v.name == "x"));
+        assert!(kids.iter().any(|v| v.name == "y"));
+        // Function ranges still resolve through the fast path.
+        let fns = Backend::extract_fns(&tree, src);
+        assert_eq!(fns.len(), 1);
+        assert!(fns.contains_key("main"));
+    }
+
+    #[test]
+    fn thousands_of_writes_extract_quickly() {
+        // Regression guard for the 6-minute open: 8000 assignments in
+        // one function used to take minutes (quadratic dedupe plus a
+        // full file rescan per position). Bound is generous; the fixed
+        // path runs in well under a second.
+        let mut src = String::from("init_waypoints()\n{\n\twp = [];\n");
+        for i in 0..8000 {
+            src.push_str(&format!("\twp{i} = {i};\n"));
+        }
+        src.push_str("}\n");
+        let tree = parse(&src);
+        let t = std::time::Instant::now();
+        let syms = Backend::extract_syms(&tree, &src);
+        let ms = t.elapsed().as_millis();
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].children.as_ref().unwrap().len(), 8001);
+        assert!(ms < 30_000, "extract took {ms}ms");
+    }
+}
+

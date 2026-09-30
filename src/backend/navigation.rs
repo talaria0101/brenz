@@ -203,13 +203,30 @@ impl Backend {
         path: Option<&str>,
         script: &str,
     ) -> Option<Uri> {
+        let mut visited: HashSet<Uri> = HashSet::new();
+        self.ensure_script_loaded_shared(path, script, &mut visited)
+            .await
+    }
+
+    /// Transitive load sharing the caller's `visited` set: scripts an
+    /// earlier reference already expanded are skipped without re-walk.
+    /// Diagnostics passes one set for the whole file; single hover or
+    /// goto requests use the fresh-set wrapper above.
+    // `Uri` carries interior mutability but is never mutated in place
+    // here; it is only ever an immutable visited marker.
+    #[allow(clippy::mutable_key_type)]
+    pub(crate) async fn ensure_script_loaded_shared(
+        &self,
+        path: Option<&str>,
+        script: &str,
+        visited: &mut HashSet<Uri>,
+    ) -> Option<Uri> {
         // Timed transitive load: one call pulls the target plus every
         // script it references, so this total is the number hover and
         // diagnostics wait on after an open.
         let total_start = std::time::Instant::now();
         let first_path = path.map(str::to_string);
         let first_script = script.to_string();
-        let mut visited: HashSet<Uri> = HashSet::new();
         let mut target: Option<Uri> = None;
         let mut queue: Vec<(Option<String>, String)> = vec![(first_path, first_script.clone())];
         let mut loads = 0usize;
@@ -262,6 +279,11 @@ impl Backend {
     /// include index (loose files, then `.pk3` archives) is searched
     /// case-insensitively.
     async fn load_one_script(&self, path: Option<&str>, script: &str) -> Option<Uri> {
+        // Serialize whole loads: the freshness check below must cover
+        // the read plus parse plus store, or two tasks both see a
+        // missing script and both pay full price (tens of seconds on
+        // huge waypoint files). See `dep_lock`.
+        let _guard = self.dep_lock.lock().await;
         let load_start = std::time::Instant::now();
         let root = self.script_root().await;
         if let Ok(abs) =

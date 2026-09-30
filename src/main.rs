@@ -476,16 +476,6 @@ impl LanguageServer for Backend {
             logprint!(LogType::Info, "(hover) in a call_node");
             let builtin_info: String = {
                 let r = self.builtins_doc.lock().await;
-                logprint!(
-                    LogType::Info,
-                    "The identifier in question: {}",
-                    &identifier.to_lowercase()
-                );
-                logprint!(
-                    LogType::Info,
-                    "Builtin functions: {:#?}",
-                    r.functions.keys()
-                );
                 let b = r.methods.get(&identifier.to_ascii_lowercase());
 
                 if let Some(b) = b {
@@ -500,7 +490,6 @@ impl LanguageServer for Backend {
                 }
             };
             if !builtin_info.is_empty() {
-                logprint!(LogType::Info, "txt: {}", &builtin_info);
                 logprint!(
                     LogType::Info,
                     "Brenz timing: hover total={}ms hit=builtin uri={}",
@@ -677,6 +666,21 @@ impl LanguageServer for Backend {
         }
 
         if let Some(local_sym_defs) = self.sym_defs.lock().await.get(&uri) {
+            // One scope walk per request: the old code re-ran the full
+            // walk for every variable, which is quadratic per keystroke
+            // on files with thousands of writes.
+            let t = std::time::Instant::now();
+            let scoped = comp::scope_vars(&tree, &src, byte);
+            let scope_ms = crate::util::timing_ms(t);
+            if scope_ms >= 100 {
+                logprint!(
+                    LogType::Info,
+                    "Brenz timing: completion scope_vars={}ms vars={} uri={}",
+                    scope_ms,
+                    scoped.len(),
+                    uri.as_str()
+                );
+            }
             for sym in local_sym_defs {
                 if sym.kind == SymbolKind::FUNCTION && comp::fuzzy_score(prefix, &sym.name) > 0 {
                     let params = comp::head_params(sym.detail.as_deref().unwrap_or(""));
@@ -705,10 +709,10 @@ impl LanguageServer for Backend {
                         }
                         // Same-type variables float to the top when the
                         // argument slot declares a type.
-                        let var_ty = comp::scope_vars(&tree, &src, byte)
-                            .into_iter()
+                        let var_ty = scoped
+                            .iter()
                             .find(|v| v.name == var.name)
-                            .and_then(|v| v.ty);
+                            .and_then(|v| v.ty.clone());
                         let tier = u32::from(
                             !(expected.is_some() && var_ty.is_some() && expected == var_ty),
                         );
