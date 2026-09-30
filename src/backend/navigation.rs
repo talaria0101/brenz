@@ -228,23 +228,27 @@ impl Backend {
         let first_path = path.map(str::to_string);
         let first_script = script.to_string();
         let mut target: Option<Uri> = None;
-        let mut queue: Vec<(Option<String>, String)> = vec![(first_path, first_script.clone())];
+        // Level-batched BFS: each level's files resolve and read
+        // serially (fast IO), then parse plus extract in parallel,
+        // then merge. Same closure as the old one-at-a-time queue,
+        // just wider per round.
+        let mut frontier = vec![(first_path, first_script.clone())];
         let mut loads = 0usize;
         let mut revisited = 0usize;
 
-        while let Some((p, s)) = queue.pop() {
-            let Some(uri) = self.load_one_script(p.as_deref(), &s).await else {
-                continue;
-            };
-            loads += 1;
-            if target.is_none() {
-                target = Some(uri.clone());
+        while !frontier.is_empty() {
+            let batch = std::mem::take(&mut frontier);
+            for uri in self.load_many_scripts(batch).await {
+                loads += 1;
+                if target.is_none() {
+                    target = Some(uri.clone());
+                }
+                if visited.insert(uri.clone()) {
+                    frontier.extend(self.foreign_refs_of(&uri).await);
+                } else {
+                    revisited += 1;
+                }
             }
-            if !visited.insert(uri.clone()) {
-                revisited += 1;
-                continue;
-            }
-            queue.extend(self.foreign_refs_of(&uri).await);
         }
 
         logprint!(
@@ -274,17 +278,11 @@ impl Backend {
         }
     }
 
-    /// Load one script if needed and return its URI: a workspace file is
-    /// read from disk when it has not been opened yet, otherwise the
-    /// include index (loose files, then `.pk3` archives) is searched
-    /// case-insensitively.
-    async fn load_one_script(&self, path: Option<&str>, script: &str) -> Option<Uri> {
-        // Serialize whole loads: the freshness check below must cover
-        // the read plus parse plus store, or two tasks both see a
-        // missing script and both pay full price (tens of seconds on
-        // huge waypoint files). See `dep_lock`.
-        let _guard = self.dep_lock.lock().await;
-        let load_start = std::time::Instant::now();
+    /// Resolve one script to its URI plus text without parsing, so the
+    /// batch path can read a whole level before parsing it in
+    /// parallel. Workspace files win, exactly like the old serial
+    /// loader; returns `None` when the script exists nowhere.
+    async fn load_script_text(&self, path: Option<&str>, script: &str) -> Option<(Uri, String)> {
         let root = self.script_root().await;
         if let Ok(abs) =
             util::resolove_scr_path(&root, path.map(str::to_string), script.to_string())
@@ -293,20 +291,7 @@ impl Backend {
             match std::fs::read_to_string(&abs) {
                 Ok(text) => {
                     let uri = Uri::from_file_path(&abs)?;
-                    let fresh = !self.fn_defs.lock().await.contains_key(&uri);
-                    if fresh {
-                        self.parse_and_store(uri.clone(), &text).await;
-                    }
-                    logprint!(
-                        LogType::Info,
-                        "Brenz timing: load_one_script src=workspace fresh={} bytes={} total={}ms script={} uri={}",
-                        fresh,
-                        text.len(),
-                        crate::util::timing_ms(load_start),
-                        script,
-                        uri.as_str()
-                    );
-                    return Some(uri);
+                    return Some((uri, text));
                 }
                 Err(e) => {
                     // Fall through to the include lookup below.
@@ -329,47 +314,102 @@ impl Backend {
             .next()?;
         let lookup_ms = crate::util::timing_ms(t);
         let uri = script_uri_for(&entry)?;
-        let fresh = !self.fn_defs.lock().await.contains_key(&uri);
-        if fresh {
-            let t = std::time::Instant::now();
-            let text = match self.include_index.lock().await.read_script_text(&entry) {
-                Ok(t) => t,
-                Err(e) => {
-                    logprint!(LogType::Error, "Couldn't read {}: {e}", entry.display());
-                    return None;
-                }
-            };
-            let read_ms = crate::util::timing_ms(t);
-            logprint!(
-                LogType::Info,
-                "Loaded {} (read={}ms)",
-                entry.display(),
-                read_ms
-            );
-            if !self.parse_and_store(uri.clone(), &text).await {
+        let t = std::time::Instant::now();
+        let text = match self.include_index.lock().await.read_script_text(&entry) {
+            Ok(t) => t,
+            Err(e) => {
+                logprint!(LogType::Error, "Couldn't read {}: {e}", entry.display());
                 return None;
             }
-            logprint!(
-                LogType::Info,
-                "Brenz timing: load_one_script src=include fresh=true lookup={}ms read={}ms bytes={} total={}ms script={} uri={}",
-                lookup_ms,
-                read_ms,
-                text.len(),
-                crate::util::timing_ms(load_start),
-                script,
-                uri.as_str()
-            );
-        } else {
-            logprint!(
-                LogType::Info,
-                "Brenz timing: load_one_script src=include fresh=false lookup={}ms total={}ms script={} uri={}",
-                lookup_ms,
-                crate::util::timing_ms(load_start),
-                script,
-                uri.as_str()
-            );
+        };
+        logprint!(
+            LogType::Info,
+            "Loaded {} (lookup={}ms read={}ms)",
+            entry.display(),
+            lookup_ms,
+            crate::util::timing_ms(t)
+        );
+        Some((uri, text))
+    }
+
+    /// Resolve, read, parse and store a batch of scripts, returning the
+    /// URIs that ended up loaded, in first-seen order. Files already in
+    /// memory are returned without work; unresolvable or unparseable
+    /// files are skipped, like the old one-at-a-time loader.
+    ///
+    /// The whole batch runs under `dep_lock`, so concurrent tasks never
+    /// parse the same huge file twice (that duplicated tens of seconds
+    /// per waypoint file). Parsing plus extraction runs through
+    /// `batch_parse`: serial below `PAR_BATCH_MIN_LEN`, rayon above.
+    // `Uri` carries interior mutability but is never mutated in place
+    // here; it is only ever an immutable dedupe marker.
+    #[allow(clippy::mutable_key_type)]
+    async fn load_many_scripts(&self, items: Vec<(Option<String>, String)>) -> Vec<Uri> {
+        use crate::backend::parsing::PAR_BATCH_MIN_LEN;
+
+        let batch_start = std::time::Instant::now();
+        let requested = items.len();
+        let _guard = self.dep_lock.lock().await;
+        // Phase 1: resolve plus read, deduped with first-seen order so
+        // the requested script stays first out.
+        let mut seen: HashSet<Uri> = HashSet::new();
+        let mut order: Vec<Uri> = Vec::new();
+        let mut pending: Vec<(Uri, String)> = Vec::new();
+        let mut known = 0usize;
+        let mut missing = 0usize;
+        for (p, s) in items {
+            let Some((uri, text)) = self.load_script_text(p.as_deref(), &s).await else {
+                missing += 1;
+                continue;
+            };
+            if !seen.insert(uri.clone()) {
+                continue;
+            }
+            order.push(uri.clone());
+            if self.fn_defs.lock().await.contains_key(&uri) {
+                known += 1;
+            } else {
+                pending.push((uri, text));
+            }
         }
-        Some(uri)
+        // Phase 2: parse plus extract. `spawn_blocking` keeps the async
+        // pool fluid while rayon spreads files over worker threads.
+        let parallel = pending.len() >= PAR_BATCH_MIN_LEN;
+        let parsed = if pending.is_empty() {
+            Vec::new()
+        } else {
+            tokio::task::spawn_blocking(move || Backend::batch_parse(pending))
+                .await
+                .unwrap_or_else(|e| {
+                    logprint!(LogType::Error, "Load batch panicked or cancelled: {e}");
+                    Vec::new()
+                })
+        };
+        // Phase 3: store. Result order follows first-seen order with
+        // unparseable files dropped.
+        let mut failed: Vec<Uri> = Vec::new();
+        for (uri, text, parsed) in parsed {
+            match parsed {
+                Some((tree, fns, syms)) => {
+                    self.store_parsed(uri, text, tree, fns, syms).await;
+                }
+                None => failed.push(uri),
+            }
+        }
+        let out: Vec<Uri> = order.into_iter().filter(|u| !failed.contains(u)).collect();
+        logprint!(
+            LogType::Info,
+            "Brenz timing: load_many requested={} unique={} known={} parsed={} failed={} missing={} parallel={} total={}ms",
+            requested,
+            seen.len(),
+            known,
+            out.len().saturating_sub(known),
+            failed.len(),
+            missing,
+            parallel,
+            crate::util::timing_ms(batch_start)
+        );
+        out
     }
 
     /// Foreign script references made by an already-loaded script.

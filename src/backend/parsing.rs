@@ -4,10 +4,40 @@ use crate::compiler::compile::compile as compile_gsc;
 use crate::util::{LogType, logprint};
 
 use super::Backend;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use tower_lsp::lsp_types::*;
 use tower_lsp_server as tower_lsp;
-use tree_sitter::Tree;
+use tree_sitter::{Parser, Tree};
+
+/// Minimum files in a load batch to spread over rayon threads.
+/// Below this the pool scheduling plus thread handoff costs more
+/// than it saves; typical dependency levels here are 20 to 250.
+pub(crate) const PAR_BATCH_MIN_LEN: usize = 8;
+
+/// One batch entry through parse plus extract: identity, text, and
+/// the parse result (`None` when the text yields no tree).
+type BatchParsed = (
+    Uri,
+    String,
+    Option<(Tree, super::FnDefs, Vec<DocumentSymbol>)>,
+);
+
+thread_local! {
+    /// One tree-sitter parser per worker thread. Parsing needs `&mut`,
+    /// so sharing a single parser would serialize everything behind a
+    /// lock; thread-local parsers let batch files parse truly in
+    /// parallel. Only the batch path uses these; interactive single
+    /// parses keep using the backend's own parser.
+    static WORKER_PARSER: RefCell<Parser> = RefCell::new({
+        let language = tree_sitter_gsc::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser
+            .set_language(&language)
+            .expect("Error loading GSC language");
+        parser
+    });
+}
 
 impl Backend {
     /// The whole pipeline for one document version: brackets, parse,
@@ -369,50 +399,66 @@ impl Backend {
         (start, end)
     }
 
-    /// Parse `text` and store the tree, functions, symbols and content
-    /// under `uri` without publishing diagnostics. Used for scripts that
-    /// were not opened by the client: workspace files read from disk and
-    /// scripts loaded from `.pk3` archives.
-    pub(crate) async fn parse_and_store(&self, uri: Uri, text: &str) -> bool {
-        let store_start = std::time::Instant::now();
-        let t = std::time::Instant::now();
-        let tree = { self.parser.lock().await.parse(text, None) };
-        let parse_ms = crate::util::timing_ms(t);
-        let Some(tree) = tree else {
-            logprint!(
-                LogType::Info,
-                "Brenz timing: parse_and_store parse={}ms result=null-tree bytes={} uri={}",
-                parse_ms,
-                text.len(),
-                uri.as_str()
-            );
-            return false;
-        };
-        let t = std::time::Instant::now();
-        let fns = Self::extract_fns(&tree, text);
-        let syms = Self::extract_syms(&tree, text);
-        let extract_ms = crate::util::timing_ms(t);
-        let fn_count = fns.len();
-        let sym_count = syms.len();
+    /// Insert an already-parsed script under `uri`: tree, functions,
+    /// symbols and text. The batch path parses on rayon workers, then
+    /// funnels every result through here on the async side.
+    pub(crate) async fn store_parsed(
+        &self,
+        uri: Uri,
+        text: String,
+        tree: Tree,
+        fns: super::FnDefs,
+        syms: Vec<DocumentSymbol>,
+    ) {
         self.trees.lock().await.insert(uri.clone(), tree);
         self.fn_defs.lock().await.insert(uri.clone(), fns);
         self.sym_defs.lock().await.insert(uri.clone(), syms);
-        self.docs_content
-            .lock()
-            .await
-            .insert(uri.clone(), text.to_string());
-        logprint!(
-            LogType::Info,
-            "Brenz timing: parse_and_store parse={}ms extract={}ms fns={} syms={} total={}ms bytes={} uri={}",
-            parse_ms,
-            extract_ms,
-            fn_count,
-            sym_count,
-            crate::util::timing_ms(store_start),
-            text.len(),
-            uri.as_str()
-        );
-        true
+        self.docs_content.lock().await.insert(uri, text);
+    }
+
+    /// Parse plus extract with the calling thread's worker parser.
+    /// Output is identical to the serial `parser.parse` plus
+    /// `extract_fns` plus `extract_syms` sequence; the only difference
+    /// is which parser instance runs it, so rayon threads never touch
+    /// the backend's shared parser. Returns `None` exactly when the
+    /// serial path yields no tree.
+    pub(crate) fn parse_and_extract(
+        text: &str,
+    ) -> Option<(Tree, super::FnDefs, Vec<DocumentSymbol>)> {
+        WORKER_PARSER.with(|cell| {
+            let mut parser = cell.borrow_mut();
+            let tree = parser.parse(text, None)?;
+            let fns = Self::extract_fns(&tree, text);
+            let syms = Self::extract_syms(&tree, text);
+            Some((tree, fns, syms))
+        })
+    }
+
+    /// Parse plus extract a batch of `(uri, text)` pairs. At or above
+    /// `PAR_BATCH_MIN_LEN` the files spread over rayon threads, each
+    /// with its own worker parser; below it they run serially on the
+    /// caller. Pure CPU on owned values, so callers can run this on a
+    /// blocking thread and insert results under their own locks.
+    /// Output order matches input order.
+    pub(crate) fn batch_parse(items: Vec<(Uri, String)>) -> Vec<BatchParsed> {
+        use rayon::prelude::*;
+        if items.len() < PAR_BATCH_MIN_LEN {
+            items
+                .into_iter()
+                .map(|(uri, text)| {
+                    let parsed = Self::parse_and_extract(&text);
+                    (uri, text, parsed)
+                })
+                .collect()
+        } else {
+            items
+                .into_par_iter()
+                .map(|(uri, text)| {
+                    let parsed = Self::parse_and_extract(&text);
+                    (uri, text, parsed)
+                })
+                .collect()
+        }
     }
 
     /// Get function definitions from parsed trees
@@ -625,3 +671,86 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod par_tests {
+    use super::*;
+
+    fn parse(src: &str) -> tree_sitter::Tree {
+        let language = tree_sitter_gsc::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        parser.parse(src, None).unwrap()
+    }
+
+    fn uri(n: usize) -> Uri {
+        format!("file:///tmp/batch{n}.gsc").parse().unwrap()
+    }
+
+    fn src(n: usize) -> String {
+        format!("f{n}()\n{{\n\tx = {n};\n\ty = x + 1;\n}}\n")
+    }
+
+    fn serial_fns_syms(text: &str) -> (super::super::FnDefs, Vec<DocumentSymbol>) {
+        let tree = parse(text);
+        (
+            Backend::extract_fns(&tree, text),
+            Backend::extract_syms(&tree, text),
+        )
+    }
+
+    fn check_batch(items: Vec<(Uri, String)>) {
+        let want: Vec<(String, Vec<String>, Vec<String>)> = items
+            .iter()
+            .map(|(u, t)| {
+                let (fns, syms) = serial_fns_syms(t);
+                let mut fk: Vec<String> = fns.keys().cloned().collect();
+                fk.sort();
+                let mut sk: Vec<String> = syms.iter().map(|s| s.name.clone()).collect();
+                sk.sort();
+                (u.as_str().to_string(), fk, sk)
+            })
+            .collect();
+        let got = Backend::batch_parse(items);
+        assert_eq!(got.len(), want.len());
+        for ((u, t, parsed), (wu, wf, ws)) in got.into_iter().zip(want) {
+            assert_eq!(u.as_str(), wu);
+            let Some((_tree, fns, syms)) = parsed else {
+                panic!("unparseable sample");
+            };
+            let mut fk: Vec<String> = fns.keys().cloned().collect();
+            fk.sort();
+            let mut sk: Vec<String> = syms.iter().map(|s| s.name.clone()).collect();
+            sk.sort();
+            assert_eq!(fk, wf);
+            assert_eq!(sk, ws);
+            assert_eq!(
+                t,
+                src(wu
+                    .rsplit("batch")
+                    .next()
+                    .unwrap()
+                    .trim_end_matches(".gsc")
+                    .parse()
+                    .unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn batch_below_min_len_matches_serial() {
+        // Fewer than PAR_BATCH_MIN_LEN: serial branch, same output.
+        let items: Vec<(Uri, String)> = (0..3).map(|n| (uri(n), src(n))).collect();
+        assert!(items.len() < PAR_BATCH_MIN_LEN);
+        check_batch(items);
+    }
+
+    #[test]
+    fn batch_above_min_len_matches_serial() {
+        // At or above the threshold: rayon branch, order preserved.
+        check_batch(
+            (0..PAR_BATCH_MIN_LEN + 4)
+                .map(|n| (uri(n), src(n)))
+                .collect(),
+        );
+    }
+}

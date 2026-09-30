@@ -50,11 +50,11 @@ pub struct Backend {
     pub config: Arc<Mutex<BrenzConfig>>,
     /// Index of scripts inside `.pk3` archives from `pk3_paths`
     pub include_index: Arc<Mutex<IncludeIndex>>,
-    /// Serializes on-demand dependency loads (`load_one_script`).
+    /// Serializes on-demand dependency loads (`load_many_scripts`).
     /// Without it two concurrent tasks (e.g. diagnostics and hover)
     /// both see a script as missing and both pay the full read plus
     /// parse plus extract, which on 400KB waypoint files is tens of
-    /// seconds each. Only ever taken at the top of `load_one_script`,
+    /// seconds each. Only ever taken at the top of `load_many_scripts`,
     /// never while holding another lock in the other order, so it
     /// cannot deadlock: waiters simply find the script cached.
     pub dep_lock: Arc<Mutex<()>>,

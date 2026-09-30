@@ -132,6 +132,7 @@ dependencies = [
  "clap",
  "log",
  "nucleo",
+ "rayon",
  "ron",
  "serde",
  "tokio",
