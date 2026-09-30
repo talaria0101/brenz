@@ -20,21 +20,55 @@ impl LanguageServer for Backend {
         &self,
         params: InitializeParams,
     ) -> Result<InitializeResult, jsonrpc::Error> {
+        // Timed startup: every stage logs how long it took, in
+        // milliseconds, both to /tmp/brenz_lsp.log (logprint, works
+        // in release) and to the client log (visible as LSP Server
+        // Log). The `Brenz timing:` prefix keeps them greppable.
+        let total_start = std::time::Instant::now();
+        let mut t = std::time::Instant::now();
         self.unpack_docs();
+        let unpack_ms = crate::util::timing_ms(t);
+        t = std::time::Instant::now();
         self.load_docs().await;
+        let load_docs_ms = crate::util::timing_ms(t);
+        t = std::time::Instant::now();
         let (f, m) = {
             let b = self.builtins_doc.lock().await;
             (b.functions.clone(), b.methods.clone())
         };
+        let snapshot_ms = crate::util::timing_ms(t);
+        t = std::time::Instant::now();
         logprint!(
             LogType::Info,
             "Builtin functions: \n{}",
             ron::ser::to_string_pretty(&f, util::ron_pcfg().to_owned()).unwrap()
         );
+        let dump_fns_ms = crate::util::timing_ms(t);
+        t = std::time::Instant::now();
         logprint!(
             LogType::Info,
             "Builtin methods: \n{}",
             ron::ser::to_string_pretty(&m, util::ron_pcfg().to_owned()).unwrap()
+        );
+        let dump_methods_ms = crate::util::timing_ms(t);
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "Brenz timing: unpack_docs={}ms load_docs={}ms snapshot={}ms dump_fns={}ms dump_methods={}ms fns={} methods={}",
+                    unpack_ms, load_docs_ms, snapshot_ms, dump_fns_ms, dump_methods_ms,
+                    f.len(), m.len()
+                ),
+            )
+            .await;
+        logprint!(
+            LogType::Info,
+            "Brenz timing: unpack_docs={}ms load_docs={}ms snapshot={}ms dump_fns={}ms dump_methods={}ms",
+            unpack_ms,
+            load_docs_ms,
+            snapshot_ms,
+            dump_fns_ms,
+            dump_methods_ms
         );
         // Thanks to Claude for helping with workspace root
         self.client
@@ -80,7 +114,9 @@ impl LanguageServer for Backend {
         // read (archive central directories, directory walks), never
         // file contents, so this stays fast.
         let root = self.workspace_root.lock().await.clone();
+        t = std::time::Instant::now();
         let cfg = crate::config::BrenzConfig::load(root.as_ref());
+        let cfg_ms = crate::util::timing_ms(t);
         if cfg.root.is_some() || !cfg.include_paths.is_empty() {
             self.client
                 .log_message(
@@ -92,10 +128,31 @@ impl LanguageServer for Backend {
                 )
                 .await;
         }
+        t = std::time::Instant::now();
         let index = crate::include::IncludeIndex::load_or_build(root.as_ref(), &cfg.include_paths);
+        let index_ms = crate::util::timing_ms(t);
+        let index_entries = index.entry_count();
         *self.config.lock().await = cfg;
         *self.include_index.lock().await = index;
 
+        let total_ms = crate::util::timing_ms(total_start);
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "Brenz timing: config_load={}ms include_index={}ms entries={} initialize_total={}ms",
+                    cfg_ms, index_ms, index_entries, total_ms
+                ),
+            )
+            .await;
+        logprint!(
+            LogType::Info,
+            "Brenz timing: config_load={}ms include_index={}ms entries={} initialize_total={}ms",
+            cfg_ms,
+            index_ms,
+            index_entries,
+            total_ms
+        );
         logprint!(LogType::Info, "Brenz initializing");
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -140,6 +197,7 @@ impl LanguageServer for Backend {
 
     // A document opened: stash its text, then parse and diagnose.
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let open_start = std::time::Instant::now();
         self.client
             .log_message(
                 MessageType::INFO,
@@ -154,6 +212,23 @@ impl LanguageServer for Backend {
         );
         self.parse_and_diagnose(params.text_document.uri.clone(), &params.text_document.text)
             .await;
+        let open_ms = crate::util::timing_ms(open_start);
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "Brenz timing: did_open total={}ms uri={}",
+                    open_ms,
+                    params.text_document.uri.as_str()
+                ),
+            )
+            .await;
+        logprint!(
+            LogType::Info,
+            "Brenz timing: did_open total={}ms uri={}",
+            open_ms,
+            params.text_document.uri.as_str()
+        );
     }
 
     // Full-sync edits with a 300ms debounce, so typing never
@@ -222,6 +297,7 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> jsonrpc::Result<Option<GotoDefinitionResponse>> {
+        let def_start = std::time::Instant::now();
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
 
@@ -229,13 +305,29 @@ impl LanguageServer for Backend {
             let trees = self.trees.lock().await;
             let tree = match trees.get(&uri) {
                 Some(t) => t.clone(),
-                None => return Ok(None),
+                None => {
+                    logprint!(
+                        LogType::Info,
+                        "Brenz timing: goto_definition total={}ms hit=no-tree uri={}",
+                        crate::util::timing_ms(def_start),
+                        uri.as_str()
+                    );
+                    return Ok(None);
+                }
             };
 
             let dc = self.docs_content.lock().await;
             let src = match dc.get(&uri) {
                 Some(s) => s.clone(),
-                None => return Ok(None),
+                None => {
+                    logprint!(
+                        LogType::Info,
+                        "Brenz timing: goto_definition total={}ms hit=no-text uri={}",
+                        crate::util::timing_ms(def_start),
+                        uri.as_str()
+                    );
+                    return Ok(None);
+                }
             };
 
             (tree, src)
@@ -244,6 +336,12 @@ impl LanguageServer for Backend {
         let node = self.node_at_pos(&tree, &src, pos).unwrap();
         //self.client.log_message(MessageType::INFO, format!("kind: {}, field: {}", node.kind(), node.parent().unwrap().kind())).await;
         if node.kind() != "identifier" {
+            logprint!(
+                LogType::Info,
+                "Brenz timing: goto_definition total={}ms hit=non-ident uri={}",
+                crate::util::timing_ms(def_start),
+                uri.as_str()
+            );
             return Ok(None);
         }
 
@@ -254,7 +352,21 @@ impl LanguageServer for Backend {
             .or_else(|| self.find_parent_of_kind(node, "function_pointer"))
         {
             logprint!(LogType::Info, "in a call_node");
-            if let Some(res) = self.resolve_target_fn(fn_node, &src, &uri, false).await {
+            let resolve_start = std::time::Instant::now();
+            let resolved = self.resolve_target_fn(fn_node, &src, &uri, false).await;
+            logprint!(
+                LogType::Info,
+                "Brenz timing: goto_definition resolve_target_fn={}ms uri={}",
+                crate::util::timing_ms(resolve_start),
+                uri.as_str()
+            );
+            if let Some(res) = resolved {
+                logprint!(
+                    LogType::Info,
+                    "Brenz timing: goto_definition total={}ms hit=call uri={}",
+                    crate::util::timing_ms(def_start),
+                    uri.as_str()
+                );
                 return Ok(Some(GotoDefinitionResponse::Scalar(res.0)));
             }
         }
@@ -265,18 +377,31 @@ impl LanguageServer for Backend {
                 start: Self::byte_to_position(&src, assignment_node.start_byte()),
                 end: Self::byte_to_position(&src, assignment_node.end_byte()),
             };
+            logprint!(
+                LogType::Info,
+                "Brenz timing: goto_definition total={}ms hit=var uri={}",
+                crate::util::timing_ms(def_start),
+                uri.as_str()
+            );
             return Ok(Some(GotoDefinitionResponse::Scalar(Location {
                 uri,
                 range,
             })));
         }
 
+        logprint!(
+            LogType::Info,
+            "Brenz timing: goto_definition total={}ms hit=none uri={}",
+            crate::util::timing_ms(def_start),
+            uri.as_str()
+        );
         Ok(None)
     }
 
     // Hover cards: keywords first, then builtins, then user
     // functions with their doc comments.
     async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
+        let hover_start = std::time::Instant::now();
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
 
@@ -284,13 +409,29 @@ impl LanguageServer for Backend {
             let trees = self.trees.lock().await;
             let tree = match trees.get(&uri) {
                 Some(t) => t.clone(),
-                None => return Ok(None),
+                None => {
+                    logprint!(
+                        LogType::Info,
+                        "Brenz timing: hover total={}ms hit=no-tree uri={}",
+                        crate::util::timing_ms(hover_start),
+                        uri.as_str()
+                    );
+                    return Ok(None);
+                }
             };
 
             let dc = self.docs_content.lock().await;
             let src = match dc.get(&uri) {
                 Some(s) => s.clone(),
-                None => return Ok(None),
+                None => {
+                    logprint!(
+                        LogType::Info,
+                        "Brenz timing: hover total={}ms hit=no-text uri={}",
+                        crate::util::timing_ms(hover_start),
+                        uri.as_str()
+                    );
+                    return Ok(None);
+                }
             };
 
             (tree, src)
@@ -360,18 +501,38 @@ impl LanguageServer for Backend {
             };
             if !builtin_info.is_empty() {
                 logprint!(LogType::Info, "txt: {}", &builtin_info);
+                logprint!(
+                    LogType::Info,
+                    "Brenz timing: hover total={}ms hit=builtin uri={}",
+                    crate::util::timing_ms(hover_start),
+                    uri.as_str()
+                );
                 return Ok(Some(Hover {
                     contents: HoverContents::Scalar(MarkedString::String(builtin_info)),
                     range: None,
                 }));
             }
 
-            match self.resolve_target_fn(call_node, &src, &uri, true).await {
+            let resolve_start = std::time::Instant::now();
+            let resolved = self.resolve_target_fn(call_node, &src, &uri, true).await;
+            logprint!(
+                LogType::Info,
+                "Brenz timing: hover resolve_target_fn={}ms uri={}",
+                crate::util::timing_ms(resolve_start),
+                uri.as_str()
+            );
+            match resolved {
                 Some(res) => {
                     let txt = self
-                        .hover_info(res, uri)
+                        .hover_info(res, uri.clone())
                         .await
                         .unwrap_or(String::from("Failed to get hover info"));
+                    logprint!(
+                        LogType::Info,
+                        "Brenz timing: hover total={}ms hit=user-fn uri={}",
+                        crate::util::timing_ms(hover_start),
+                        uri.as_str()
+                    );
                     return Ok(Some(Hover {
                         contents: HoverContents::Scalar(MarkedString::String(txt)),
                         range: None,
@@ -383,6 +544,12 @@ impl LanguageServer for Backend {
             }
         }
 
+        logprint!(
+            LogType::Info,
+            "Brenz timing: hover total={}ms hit=fallback uri={}",
+            crate::util::timing_ms(hover_start),
+            uri.as_str()
+        );
         Ok(Some(Hover {
             contents: HoverContents::Scalar(MarkedString::String(
                 "We're not there yet.\n[Contribute :)](https://gitlab.com/kazam0180/brenz)"
@@ -426,6 +593,7 @@ impl LanguageServer for Backend {
     ) -> jsonrpc::Result<Option<CompletionResponse>> {
         use crate::backend::completion as comp;
         use crate::doc::GscType;
+        let comp_start = std::time::Instant::now();
 
         let uri = params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
@@ -592,6 +760,15 @@ impl LanguageServer for Backend {
             }
         }
 
+        let comp_total = suggestions.len();
+        logprint!(
+            LogType::Info,
+            "Brenz timing: completion prefix={} suggestions={} total={}ms uri={}",
+            prefix,
+            comp_total,
+            crate::util::timing_ms(comp_start),
+            uri.as_str()
+        );
         Ok(Some(CompletionResponse::Array(suggestions)))
     }
 

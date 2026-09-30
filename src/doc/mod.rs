@@ -146,6 +146,7 @@ impl Backend {
     /// Unpack the embedded docs where the server expects them.
     /// Always overwrites: the copy belongs to the binary version.
     pub(crate) fn unpack_docs(&self) {
+        let start = std::time::Instant::now();
         let data_dir = util::get_data_dir().unwrap();
         let docs_dir = data_dir.join("docs");
         let fns_file = docs_dir.join("builtins.ron");
@@ -158,18 +159,30 @@ impl Backend {
         // Drop the artifacts of the old JSON format, if present.
         let _ = fs::remove_file(docs_dir.join("builtins.json"));
         let _ = fs::remove_file(docs_dir.join("brenz-builtins-schema.json"));
+        util::logprint!(
+            util::LogType::Info,
+            "Brenz timing: unpack_docs bytes={} total={}ms path={}",
+            BUILTINS.len(),
+            util::timing_ms(start),
+            fns_file.display()
+        );
     }
 
     /// Load the unpacked docs into memory, falling back to the
     /// embedded copy when the file went missing or broke.
     pub(crate) async fn load_docs(&self) {
+        let start = std::time::Instant::now();
         let data_dir = util::get_data_dir().unwrap();
         let docs_dir = data_dir.join("docs");
         let fns_file = docs_dir.join("builtins.ron");
 
+        let t = std::time::Instant::now();
         let content = tokio::fs::read_to_string(&fns_file)
             .await
             .unwrap_or_else(|_| BUILTINS.to_string());
+        let read_ms = util::timing_ms(t);
+        let bytes = content.len();
+        let t = std::time::Instant::now();
         let builtins: Builtins = ron::from_str(&content).unwrap_or_else(|e| {
             util::logprint!(
                 util::LogType::Error,
@@ -177,8 +190,21 @@ impl Backend {
             );
             ron::from_str(BUILTINS).expect("embedded builtins.ron")
         });
+        let parse_ms = util::timing_ms(t);
+        let fns = builtins.functions.len();
+        let methods = builtins.methods.len();
 
         *self.builtins_doc.lock().await = builtins;
+        util::logprint!(
+            util::LogType::Info,
+            "Brenz timing: load_docs bytes={} read={}ms parse={}ms fns={} methods={} total={}ms",
+            bytes,
+            read_ms,
+            parse_ms,
+            fns,
+            methods,
+            util::timing_ms(start)
+        );
     }
 
     /// Tiny wrapper turning info text into a hover response.

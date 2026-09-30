@@ -164,13 +164,26 @@ impl IncludeIndex {
     /// have been built from a differently-cased listing, so members are
     /// compared normalized rather than with a case-sensitive lookup.
     pub(crate) fn read_script_text(&self, entry: &IncludeEntry) -> io::Result<String> {
-        match &entry.source {
+        // Timed single-script read: archive members reopen the zip
+        // every time, so a slow dependency chain shows up here.
+        let start = std::time::Instant::now();
+        let out = match &entry.source {
             ScriptSource::Archive { pk3, inner } => read_member_case_insensitive(pk3, inner),
             ScriptSource::Loose { path } => {
                 let bytes = std::fs::read(path)?;
                 Ok(String::from_utf8_lossy(&bytes).into_owned())
             }
+        };
+        if let Ok(text) = &out {
+            logprint!(
+                LogType::Info,
+                "Brenz timing: read_script_text bytes={} total={}ms src={}",
+                text.len(),
+                crate::util::timing_ms(start),
+                entry.display()
+            );
         }
+        out
     }
 
     pub(crate) fn entry_count(&self) -> usize {
@@ -186,6 +199,10 @@ impl IncludeIndex {
         workspace_root: Option<&PathBuf>,
         include_paths: &[PathBuf],
     ) -> Self {
+        // Timed index build: listing, cache reuse, fresh scans and
+        // cache write each log separately so a slow include path
+        // (big game dir, many archives) is attributable.
+        let total_start = std::time::Instant::now();
         let include_paths: Vec<PathBuf> = include_paths
             .iter()
             .map(|p| {
@@ -200,8 +217,22 @@ impl IncludeIndex {
             .collect();
         let include_paths = &include_paths;
 
+        let t = std::time::Instant::now();
         let listed = list_include_files(include_paths);
+        let list_ms = crate::util::timing_ms(t);
+        logprint!(
+            LogType::Info,
+            "Brenz timing: include_index list files={} total={}ms paths={:?}",
+            listed.len(),
+            list_ms,
+            include_paths
+        );
         if listed.is_empty() {
+            logprint!(
+                LogType::Info,
+                "Brenz timing: include_index empty total={}ms",
+                crate::util::timing_ms(total_start)
+            );
             return Self::default();
         }
 
@@ -211,12 +242,18 @@ impl IncludeIndex {
                 .join(CACHE_FILE_NAME)
         });
 
+        let t = std::time::Instant::now();
         let mut cached = cache_path
             .as_ref()
             .and_then(|p| read_cache(p, include_paths));
+        let cache_read_ms = crate::util::timing_ms(t);
+        let cache_hit_files = cached.as_ref().map(|c| c.files.len()).unwrap_or(0);
 
         let mut index = Self::default();
         let mut fresh: Vec<CachedFile> = Vec::new();
+        let mut reused_count = 0usize;
+        let mut scanned_count = 0usize;
+        let scan_start = std::time::Instant::now();
 
         for (dir_order, file) in &listed {
             let meta = match file_fingerprint(&file.path) {
@@ -235,10 +272,23 @@ impl IncludeIndex {
                     );
                 }
                 fresh.push(reused);
+                reused_count += 1;
                 continue;
             }
+            let one_start = std::time::Instant::now();
             match scan_file(file, &include_paths[*dir_order]) {
                 Ok(scanned) => {
+                    let one_ms = crate::util::timing_ms(one_start);
+                    if one_ms >= 100 {
+                        logprint!(
+                            LogType::Info,
+                            "Brenz timing: include_index scan file={} scripts={} total={}ms",
+                            file.display(),
+                            scanned.len(),
+                            one_ms
+                        );
+                    }
+                    scanned_count += 1;
                     for (key, inner) in &scanned {
                         index.insert(
                             key,
@@ -268,7 +318,9 @@ impl IncludeIndex {
                 }
             }
         }
+        let scan_ms = crate::util::timing_ms(scan_start);
 
+        let t = std::time::Instant::now();
         if let Some(path) = cache_path {
             let file = IncludeCacheFile {
                 include_paths: include_paths.to_vec(),
@@ -282,12 +334,26 @@ impl IncludeIndex {
                 );
             }
         }
+        let cache_write_ms = crate::util::timing_ms(t);
 
         logprint!(
             LogType::Info,
             "Include index: {} scripts in {} files",
             index.entry_count(),
             listed.len()
+        );
+        logprint!(
+            LogType::Info,
+            "Brenz timing: include_index list={}ms cache_read={}ms cached_files={} reused={} scanned={} scan={}ms cache_write={}ms scripts={} total={}ms",
+            list_ms,
+            cache_read_ms,
+            cache_hit_files,
+            reused_count,
+            scanned_count,
+            scan_ms,
+            cache_write_ms,
+            index.entry_count(),
+            crate::util::timing_ms(total_start)
         );
         index
     }

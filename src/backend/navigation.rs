@@ -203,23 +203,43 @@ impl Backend {
         path: Option<&str>,
         script: &str,
     ) -> Option<Uri> {
+        // Timed transitive load: one call pulls the target plus every
+        // script it references, so this total is the number hover and
+        // diagnostics wait on after an open.
+        let total_start = std::time::Instant::now();
+        let first_path = path.map(str::to_string);
+        let first_script = script.to_string();
         let mut visited: HashSet<Uri> = HashSet::new();
         let mut target: Option<Uri> = None;
-        let mut queue: Vec<(Option<String>, String)> =
-            vec![(path.map(str::to_string), script.to_string())];
+        let mut queue: Vec<(Option<String>, String)> = vec![(first_path, first_script.clone())];
+        let mut loads = 0usize;
+        let mut revisited = 0usize;
 
         while let Some((p, s)) = queue.pop() {
             let Some(uri) = self.load_one_script(p.as_deref(), &s).await else {
                 continue;
             };
+            loads += 1;
             if target.is_none() {
                 target = Some(uri.clone());
             }
             if !visited.insert(uri.clone()) {
+                revisited += 1;
                 continue;
             }
             queue.extend(self.foreign_refs_of(&uri).await);
         }
+
+        logprint!(
+            LogType::Info,
+            "Brenz timing: ensure_script_loaded script={} loads={} revisited={} visited={} total={}ms found={}",
+            first_script,
+            loads,
+            revisited,
+            visited.len(),
+            crate::util::timing_ms(total_start),
+            target.is_some()
+        );
 
         target
     }
@@ -242,6 +262,7 @@ impl Backend {
     /// include index (loose files, then `.pk3` archives) is searched
     /// case-insensitively.
     async fn load_one_script(&self, path: Option<&str>, script: &str) -> Option<Uri> {
+        let load_start = std::time::Instant::now();
         let root = self.script_root().await;
         if let Ok(abs) =
             util::resolove_scr_path(&root, path.map(str::to_string), script.to_string())
@@ -250,9 +271,19 @@ impl Backend {
             match std::fs::read_to_string(&abs) {
                 Ok(text) => {
                     let uri = Uri::from_file_path(&abs)?;
-                    if !self.fn_defs.lock().await.contains_key(&uri) {
+                    let fresh = !self.fn_defs.lock().await.contains_key(&uri);
+                    if fresh {
                         self.parse_and_store(uri.clone(), &text).await;
                     }
+                    logprint!(
+                        LogType::Info,
+                        "Brenz timing: load_one_script src=workspace fresh={} bytes={} total={}ms script={} uri={}",
+                        fresh,
+                        text.len(),
+                        crate::util::timing_ms(load_start),
+                        script,
+                        uri.as_str()
+                    );
                     return Some(uri);
                 }
                 Err(e) => {
@@ -266,6 +297,7 @@ impl Backend {
             }
         }
 
+        let t = std::time::Instant::now();
         let entry = self
             .include_index
             .lock()
@@ -273,8 +305,11 @@ impl Backend {
             .lookup(path, script)
             .into_iter()
             .next()?;
+        let lookup_ms = crate::util::timing_ms(t);
         let uri = script_uri_for(&entry)?;
-        if !self.fn_defs.lock().await.contains_key(&uri) {
+        let fresh = !self.fn_defs.lock().await.contains_key(&uri);
+        if fresh {
+            let t = std::time::Instant::now();
             let text = match self.include_index.lock().await.read_script_text(&entry) {
                 Ok(t) => t,
                 Err(e) => {
@@ -282,10 +317,35 @@ impl Backend {
                     return None;
                 }
             };
-            logprint!(LogType::Info, "Loaded {}", entry.display());
+            let read_ms = crate::util::timing_ms(t);
+            logprint!(
+                LogType::Info,
+                "Loaded {} (read={}ms)",
+                entry.display(),
+                read_ms
+            );
             if !self.parse_and_store(uri.clone(), &text).await {
                 return None;
             }
+            logprint!(
+                LogType::Info,
+                "Brenz timing: load_one_script src=include fresh=true lookup={}ms read={}ms bytes={} total={}ms script={} uri={}",
+                lookup_ms,
+                read_ms,
+                text.len(),
+                crate::util::timing_ms(load_start),
+                script,
+                uri.as_str()
+            );
+        } else {
+            logprint!(
+                LogType::Info,
+                "Brenz timing: load_one_script src=include fresh=false lookup={}ms total={}ms script={} uri={}",
+                lookup_ms,
+                crate::util::timing_ms(load_start),
+                script,
+                uri.as_str()
+            );
         }
         Some(uri)
     }

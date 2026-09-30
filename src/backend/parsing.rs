@@ -14,6 +14,14 @@ impl Backend {
     /// symbols, compile checks, project checks, then publish. Runs on
     /// open and (debounced) on every edit.
     pub async fn parse_and_diagnose(&self, uri: Uri, text: &str) {
+        // Timed pipeline: each stage logs milliseconds so a slow open
+        // shows exactly where time goes (brackets, tree-sitter parse,
+        // error walk, symbol extraction, compile check, or the
+        // project-aware script diagnostics that load dependencies).
+        // All lines use the `Brenz timing:` prefix for easy grep in
+        // /tmp/brenz_lsp.log, and work in release builds.
+        let total_start = std::time::Instant::now();
+        let text_len = text.len();
         let checker = self.checker.clone();
         let parser = self.parser.clone();
         let trees = self.trees.clone();
@@ -21,8 +29,13 @@ impl Backend {
         let sym_defs = self.sym_defs.clone();
         let client = self.client.clone();
         //let mut checker = BracketChecker::new();
+        let t = std::time::Instant::now();
         let mut checker_guard = checker.lock().await;
+        let lock_checker_ms = crate::util::timing_ms(t);
+        let t = std::time::Instant::now();
         let bracket_errors = checker_guard.check(text);
+        let bracket_ms = crate::util::timing_ms(t);
+        drop(checker_guard);
         if !bracket_errors.is_empty() {
             let diagnostics: Vec<Diagnostic> = bracket_errors
                 .into_iter()
@@ -46,21 +59,41 @@ impl Backend {
                     .await;
             }
 
-            client.publish_diagnostics(uri, diagnostics, None).await;
+            client
+                .publish_diagnostics(uri.clone(), diagnostics, None)
+                .await;
+            logprint!(
+                LogType::Info,
+                "Brenz timing: parse_and_diagnose early-exit brackets={}ms checker_lock={}ms bytes={} uri={}",
+                bracket_ms,
+                lock_checker_ms,
+                text_len,
+                uri.as_str()
+            );
             return;
         }
 
         // Parse in a narrow scope: the project-aware checks below
         // re-lock the parser for on-demand files, and holding this
         // guard across them deadlocks the task on itself.
+        let t = std::time::Instant::now();
         let tree = parser.lock().await.parse(text, None);
+        let parse_ms = crate::util::timing_ms(t);
         match tree {
             Some(tree) => {
                 {
                     trees.lock().await.insert(uri.clone(), tree.clone());
 
+                    let t = std::time::Instant::now();
                     let mut diagnostics = Self::collect_diagnostics(&tree, text);
+                    let collect_ms = crate::util::timing_ms(t);
+                    let diag_count = diagnostics.len();
 
+                    // Stage times below stay zero when the parse has
+                    // errors and the later stages are skipped.
+                    let mut extract_ms = 0;
+                    let mut compile_ms = 0;
+                    let mut script_diag_ms = 0;
                     if !diagnostics.is_empty() {
                         for (i, diag) in diagnostics.iter_mut().enumerate() {
                             client
@@ -83,20 +116,60 @@ impl Backend {
                             }
                         }
                     } else {
+                        let t = std::time::Instant::now();
                         let fns = Self::extract_fns(&tree, text);
+                        let fn_count = fns.len();
                         fn_defs.lock().await.insert(uri.clone(), fns);
                         let syms = Self::extract_syms(&tree, text);
+                        let sym_count = syms.len();
                         sym_defs.lock().await.insert(uri.clone(), syms);
+                        extract_ms = crate::util::timing_ms(t);
                         // Structural compile check: engine operations
                         // still compile, so failures here are real bugs
                         // (break outside loops, uncompilable nodes).
+                        let t = std::time::Instant::now();
                         if let Err(errors) = compile_gsc(&tree, text) {
                             diagnostics = errors.into_iter().map(|e| e.into()).collect();
                         }
-                        diagnostics.extend(self.script_diagnostics(&uri).await);
+                        compile_ms = crate::util::timing_ms(t);
+                        let t = std::time::Instant::now();
+                        let extra = self.script_diagnostics(&uri).await;
+                        script_diag_ms = crate::util::timing_ms(t);
+                        let script_diag_count = extra.len();
+                        diagnostics.extend(extra);
+                        logprint!(
+                            LogType::Info,
+                            "Brenz timing: parse_and_diagnose clean fns={} syms={} script_diags={} uri={}",
+                            fn_count,
+                            sym_count,
+                            script_diag_count,
+                            uri.as_str()
+                        );
                     }
 
-                    client.publish_diagnostics(uri, diagnostics, None).await;
+                    let t = std::time::Instant::now();
+                    let diag_total = diagnostics.len();
+                    client
+                        .publish_diagnostics(uri.clone(), diagnostics, None)
+                        .await;
+                    let publish_ms = crate::util::timing_ms(t);
+                    let total_ms = crate::util::timing_ms(total_start);
+                    logprint!(
+                        LogType::Info,
+                        "Brenz timing: parse_and_diagnose brackets={}ms parse={}ms collect={}ms (initial_diags={}) extract={}ms compile={}ms script_diag={}ms publish={}ms final_diags={} total={}ms bytes={} uri={}",
+                        bracket_ms,
+                        parse_ms,
+                        collect_ms,
+                        diag_count,
+                        extract_ms,
+                        compile_ms,
+                        script_diag_ms,
+                        publish_ms,
+                        diag_total,
+                        total_ms,
+                        text_len,
+                        uri.as_str()
+                    );
                 }
             }
             None => {
@@ -122,8 +195,17 @@ impl Backend {
                 };
 
                 client
-                    .publish_diagnostics(uri, vec![diagnostic], None)
+                    .publish_diagnostics(uri.clone(), vec![diagnostic], None)
                     .await;
+                logprint!(
+                    LogType::Info,
+                    "Brenz timing: parse_and_diagnose brackets={}ms parse={}ms result=null-tree total={}ms bytes={} uri={}",
+                    bracket_ms,
+                    parse_ms,
+                    crate::util::timing_ms(total_start),
+                    text_len,
+                    uri.as_str()
+                );
             }
         }
     }
@@ -292,16 +374,44 @@ impl Backend {
     /// were not opened by the client: workspace files read from disk and
     /// scripts loaded from `.pk3` archives.
     pub(crate) async fn parse_and_store(&self, uri: Uri, text: &str) -> bool {
+        let store_start = std::time::Instant::now();
+        let t = std::time::Instant::now();
         let tree = { self.parser.lock().await.parse(text, None) };
+        let parse_ms = crate::util::timing_ms(t);
         let Some(tree) = tree else {
+            logprint!(
+                LogType::Info,
+                "Brenz timing: parse_and_store parse={}ms result=null-tree bytes={} uri={}",
+                parse_ms,
+                text.len(),
+                uri.as_str()
+            );
             return false;
         };
+        let t = std::time::Instant::now();
         let fns = Self::extract_fns(&tree, text);
         let syms = Self::extract_syms(&tree, text);
+        let extract_ms = crate::util::timing_ms(t);
+        let fn_count = fns.len();
+        let sym_count = syms.len();
         self.trees.lock().await.insert(uri.clone(), tree);
         self.fn_defs.lock().await.insert(uri.clone(), fns);
         self.sym_defs.lock().await.insert(uri.clone(), syms);
-        self.docs_content.lock().await.insert(uri, text.to_string());
+        self.docs_content
+            .lock()
+            .await
+            .insert(uri.clone(), text.to_string());
+        logprint!(
+            LogType::Info,
+            "Brenz timing: parse_and_store parse={}ms extract={}ms fns={} syms={} total={}ms bytes={} uri={}",
+            parse_ms,
+            extract_ms,
+            fn_count,
+            sym_count,
+            crate::util::timing_ms(store_start),
+            text.len(),
+            uri.as_str()
+        );
         true
     }
 

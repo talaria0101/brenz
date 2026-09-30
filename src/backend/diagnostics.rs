@@ -18,6 +18,7 @@ impl Backend {
     /// unresolvable foreign references. Only runs on clean parses so
     /// half-broken trees never produce noise.
     pub(crate) async fn script_diagnostics(&self, uri: &Uri) -> Vec<Diagnostic> {
+        let diag_start = std::time::Instant::now();
         let (tree, src) = {
             let trees = self.trees.lock().await;
             let tree = match trees.get(uri) {
@@ -38,14 +39,19 @@ impl Backend {
         // Foreign references anywhere (calls and `::` pointers alike).
         let mut foreigns = Vec::new();
         Self::find_descendants_of_kind(root, "foreign_function_ptr", &mut foreigns);
+        let foreign_total = foreigns.len();
+        let t = std::time::Instant::now();
         for node in foreigns {
             self.check_foreign_fn(node, &src, &mut out).await;
         }
+        let foreign_ms = crate::util::timing_ms(t);
 
         // Bare calls: engine resolves them to this file or a builtin.
+        let t = std::time::Instant::now();
         let mut calls = Vec::new();
         Self::find_descendants_of_kind(root, "direct_call", &mut calls);
         Self::find_descendants_of_kind(root, "thread_call", &mut calls);
+        let call_total = calls.len();
         for node in calls {
             if self
                 .find_child_of_kind(node, "foreign_function_ptr")
@@ -82,6 +88,18 @@ impl Backend {
                 data: None,
             });
         }
+        let bare_ms = crate::util::timing_ms(t);
+        crate::util::logprint!(
+            crate::util::LogType::Info,
+            "Brenz timing: script_diagnostics foreign_refs={} foreign_ms={}ms bare_calls={} bare_ms={}ms diags={} total={}ms uri={}",
+            foreign_total,
+            foreign_ms,
+            call_total,
+            bare_ms,
+            out.len(),
+            crate::util::timing_ms(diag_start),
+            uri.as_str()
+        );
 
         out
     }
@@ -107,7 +125,21 @@ impl Backend {
             Some(p) => format!("{}\\{script}", p.strip_suffix('\\').unwrap_or(p)),
             None => script.clone(),
         };
-        let Some(target) = self.ensure_script_loaded(path.as_deref(), &script).await else {
+        let t = std::time::Instant::now();
+        let loaded = self.ensure_script_loaded(path.as_deref(), &script).await;
+        let load_ms = crate::util::timing_ms(t);
+        // Per-reference load time: a single slow archive read shows up
+        // here, while the totals land in ensure_script_loaded.
+        if load_ms >= 50 {
+            crate::util::logprint!(
+                crate::util::LogType::Info,
+                "Brenz timing: check_foreign_fn script={} load={}ms found={}",
+                display,
+                load_ms,
+                loaded.is_some()
+            );
+        }
+        let Some(target) = loaded else {
             out.push(Self::script_diag(
                 src,
                 &script_node,

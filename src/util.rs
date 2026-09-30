@@ -108,3 +108,11 @@ pub fn ron_pcfg() -> &'static PrettyConfig {
 
     &PC
 }
+
+/// Milliseconds since `start`. Timing helper for the startup and
+/// open pipelines: callers snapshot `std::time::Instant::now()`
+/// before a stage and log `timing_ms(start)` after it, so slow
+/// stages show up in `/tmp/brenz_lsp.log` even in release builds.
+pub(crate) fn timing_ms(start: std::time::Instant) -> u128 {
+    start.elapsed().as_millis()
+}
